@@ -14,6 +14,9 @@ from app.database import get_db_context
 from app.services.user_service import UserService
 from app.services.points_service import PointsService
 from app.services.book_service import BookService
+from app.services.channel_service import ChannelService
+from app.models.force_join import ForceJoinChannel
+from aiogram.filters import Command
 from app.services.search_service import SearchService
 from app.models.book import Book, BookCategory, BookStatus
 from app.bot.keyboards import (
@@ -284,6 +287,59 @@ async def inline_search(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_query)
     await callback.answer()
 
+# ---------- أوامر الاشتراك الإجباري ----------
+@router.message(Command("addchannel"))
+async def cmd_add_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📡 أرسل معرف القناة (مثال: @MyChannel) ليتم إضافتها للاشتراك الإجباري:")
+    await state.set_state("waiting_for_channel_id")
+
+@router.message(StateFilter("waiting_for_channel_id"))
+async def process_channel_id(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    if not channel_id.startswith("@"):
+        return await message.answer("يجب أن يبدأ المعرف بـ @")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        success = await service.add_channel(channel_id)
+        if success:
+            await message.answer(f"✅ تمت إضافة القناة {channel_id} بنجاح")
+        else:
+            await message.answer("❌ فشلت الإضافة، تأكد من عدم تكرار القناة")
+    await state.clear()
+
+@router.message(Command("removechannel"))
+async def cmd_remove_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📡 أرسل معرف القناة التي تريد حذفها:")
+    await state.set_state("waiting_for_channel_remove")
+
+@router.message(StateFilter("waiting_for_channel_remove"))
+async def process_remove_channel(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    with get_db_context() as db:
+        service = ChannelService(db)
+        if await service.remove_channel(channel_id):
+            await message.answer(f"✅ تم حذف القناة {channel_id}")
+        else:
+            await message.answer("❌ القناة غير موجودة")
+    await state.clear()
+
+@router.message(Command("listchannels"))
+async def cmd_list_channels(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        channels = await service.get_all_channels()
+        if not channels:
+            return await message.answer("لا توجد قنوات اشتراك إجباري حالياً")
+        text = "📋 **قنوات الاشتراك الإجباري**\n\n"
+        for ch in channels:
+            text += f"• {ch.channel_id} {'✅' if ch.is_required else '🟡'}\n"
+        await message.answer(text)
 @router.callback_query(F.data == "cmd_help")
 async def inline_help(callback: CallbackQuery):
     help_text = (
