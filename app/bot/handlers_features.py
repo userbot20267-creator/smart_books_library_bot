@@ -1,6 +1,6 @@
 """
 New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix,
-Force Join Channels, Owner Interactive Panel
+Force Join Channels, Owner Interactive Panel, Categories & Authors Management
 """
 
 import logging
@@ -24,7 +24,10 @@ from app.services.points_service import PointsService
 from app.services.book_service import BookService
 from app.services.search_service import SearchService
 from app.services.channel_service import ChannelService
+from app.services.category_service import CategoryService
+from app.services.author_service import AuthorService
 from app.models.book import Book, BookCategory, BookStatus
+from app.models.author import Author
 from app.admin.admin_service import AdminService
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,16 @@ class SearchStates(StatesGroup):
 class ChannelStates(StatesGroup):
     waiting_for_channel_id = State()
     waiting_for_channel_remove = State()
+
+class CategoryStates(StatesGroup):
+    waiting_for_category_name = State()
+    waiting_for_category_name_ar = State()
+    waiting_for_category_id = State()
+
+class AuthorStates(StatesGroup):
+    waiting_for_author_name = State()
+    waiting_for_author_bio = State()
+    waiting_for_author_id = State()
 
 # ---------- دوال مساعدة ----------
 def is_owner(telegram_id: int) -> bool:
@@ -101,11 +114,9 @@ class ForceJoinMiddleware(BaseMiddleware):
         if not event.from_user:
             return await handler(event, data)
 
-        # تخطي الفحص للمالك
         if is_owner(event.from_user.id):
             return await handler(event, data)
 
-        # تخطي أمر /start
         if event.text and event.text.startswith('/start'):
             return await handler(event, data)
 
@@ -345,7 +356,7 @@ async def inline_help(callback: CallbackQuery):
 async def show_commands(message: Message):
     await message.answer("اختر الأمر الذي تريد:", reply_markup=get_commands_inline_keyboard())
 
-# ---------- أوامر الاشتراك الإجباري (للمالك فقط) ----------
+# ---------- أوامر الاشتراك الإجباري ----------
 @router.message(Command("addchannel"))
 async def cmd_add_channel(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
@@ -399,6 +410,126 @@ async def cmd_list_channels(message: Message):
             text += f"• {ch.channel_id} {'✅ إجباري' if ch.is_required else '🟡 اختياري'}\n"
         await message.answer(text)
 
+# ---------- إدارة الأقسام ----------
+@router.message(Command("addcategory"))
+async def cmd_addcategory(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل اسم القسم (عربي أو إنجليزي):")
+    await state.set_state(CategoryStates.waiting_for_category_name)
+
+@router.message(CategoryStates.waiting_for_category_name)
+async def process_cat_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("أرسل الاسم العربي للقسم (أو ارسل 'تخطي'):")
+    await state.set_state(CategoryStates.waiting_for_category_name_ar)
+
+@router.message(CategoryStates.waiting_for_category_name_ar)
+async def process_cat_name_ar(message: Message, state: FSMContext):
+    name_ar = message.text.strip()
+    if name_ar == 'تخطي':
+        name_ar = None
+    data = await state.get_data()
+    with get_db_context() as db:
+        service = CategoryService(db)
+        cat = await service.create(name=data['name'], name_ar=name_ar)
+        if cat:
+            await message.answer(f"✅ تم إنشاء القسم '{cat.name}'")
+        else:
+            await message.answer("❌ فشل في إنشاء القسم")
+    await state.clear()
+
+@router.message(Command("deletecategory"))
+async def cmd_deletecategory(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل ID القسم الذي تريد حذفه:")
+    await state.set_state(CategoryStates.waiting_for_category_id)
+
+@router.message(CategoryStates.waiting_for_category_id)
+async def process_delete_category(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("يجب إرسال رقم صحيح")
+    cat_id = int(message.text)
+    with get_db_context() as db:
+        service = CategoryService(db)
+        if await service.delete(cat_id):
+            await message.answer("✅ تم الحذف")
+        else:
+            await message.answer("❌ القسم غير موجود")
+    await state.clear()
+
+@router.message(Command("listcategories"))
+async def cmd_listcategories(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            return await message.answer("لا توجد أقسام")
+        text = "📁 **الأقسام**\n\n"
+        for c in cats:
+            text += f"• {c.name} (ID: {c.id})\n"
+        await message.answer(text)
+
+# ---------- إدارة المؤلفين ----------
+@router.message(Command("addauthor"))
+async def cmd_addauthor(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل اسم المؤلف:")
+    await state.set_state(AuthorStates.waiting_for_author_name)
+
+@router.message(AuthorStates.waiting_for_author_name)
+async def process_author_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("أرسل نبذة عن المؤلف (أو 'تخطي'):")
+    await state.set_state(AuthorStates.waiting_for_author_bio)
+
+@router.message(AuthorStates.waiting_for_author_bio)
+async def process_author_bio(message: Message, state: FSMContext):
+    bio = message.text.strip()
+    if bio == 'تخطي':
+        bio = None
+    data = await state.get_data()
+    with get_db_context() as db:
+        service = AuthorService(db)
+        author = await service.create(name=data['name'], bio=bio)
+        await message.answer(f"✅ تم إضافة المؤلف '{author.name}'")
+    await state.clear()
+
+@router.message(Command("deleteauthor"))
+async def cmd_deleteauthor(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل ID المؤلف:")
+    await state.set_state(AuthorStates.waiting_for_author_id)
+
+@router.message(AuthorStates.waiting_for_author_id)
+async def process_delete_author(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("يجب أن يكون رقماً")
+    author_id = int(message.text)
+    with get_db_context() as db:
+        if await AuthorService(db).delete(author_id):
+            await message.answer("✅ تم حذف المؤلف")
+        else:
+            await message.answer("❌ المؤلف غير موجود")
+    await state.clear()
+
+@router.message(Command("listauthors"))
+async def cmd_listauthors(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        authors = await AuthorService(db).list_all()
+        if not authors:
+            return await message.answer("لا يوجد مؤلفون")
+        text = "✍️ **المؤلفون**\n\n"
+        for a in authors:
+            text += f"• {a.name} (ID: {a.id})\n"
+        await message.answer(text)
+
 # ---------- لوحة تحكم المالك التفاعلية ----------
 @router.message(Command("admin"))
 async def cmd_admin_panel(message: Message):
@@ -408,6 +539,8 @@ async def cmd_admin_panel(message: Message):
         [InlineKeyboardButton(text="📊 إحصائيات", callback_data="owner_stats")],
         [InlineKeyboardButton(text="📚 كتب قيد المراجعة", callback_data="owner_pending")],
         [InlineKeyboardButton(text="📡 قنوات الإجبار", callback_data="owner_channels")],
+        [InlineKeyboardButton(text="📁 إدارة الأقسام", callback_data="owner_categories")],
+        [InlineKeyboardButton(text="✍️ إدارة المؤلفين", callback_data="owner_authors")],
         [InlineKeyboardButton(text="🔙 إغلاق", callback_data="owner_close")]
     ])
     await message.answer("👑 **لوحة تحكم المالك**", reply_markup=keyboard)
@@ -451,6 +584,16 @@ async def owner_pending(callback: CallbackQuery):
 @router.callback_query(F.data == "owner_channels")
 async def owner_channels(callback: CallbackQuery):
     await cmd_list_channels(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_categories")
+async def owner_categories(callback: CallbackQuery):
+    await cmd_listcategories(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_authors")
+async def owner_authors(callback: CallbackQuery):
+    await cmd_listauthors(callback.message)
     await callback.answer()
 
 @router.callback_query(F.data == "owner_close")
