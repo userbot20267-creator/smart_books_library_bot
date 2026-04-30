@@ -1,0 +1,1505 @@
+"""
+New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix,
+Force Join Channels, Owner Interactive Panel, Categories & Authors Management,
+User Management, AI-Powered Book Finder & Adder, Upload, Favorites, History, Ratings
+"""
+import csv
+import io
+import logging
+import os
+from datetime import datetime
+from app.models.notification import NotificationSetting
+from app.models.channel_setting import ChannelSetting
+from aiogram import Router, F, BaseMiddleware
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from typing import Any, Awaitable, Callable, Dict
+
+from config.settings import settings
+from app.bot.keyboards import (
+    get_main_keyboard,
+    get_category_keyboard,
+    get_settings_keyboard,
+    get_commands_inline_keyboard
+)
+from app.database import get_db_context
+from app.services.user_service import UserService
+from app.services.points_service import PointsService
+from app.services.book_service import BookService
+from app.services.search_service import SearchService
+from app.services.channel_service import ChannelService
+from app.services.category_service import CategoryService
+from app.services.author_service import AuthorService
+from app.services.ai_service import AIService
+from app.models.book import Book, BookCategory, BookStatus
+from app.models.author import Author
+from app.models.user import User, UserStatus
+from app.models.favorite import Favorite
+from app.models.download_history import DownloadHistory
+from app.admin.admin_service import AdminService
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+# ---------- FSM states ----------
+class SearchStates(StatesGroup):
+    waiting_for_query = State()
+    choosing_search_type = State()
+
+class ChannelStates(StatesGroup):
+    waiting_for_channel_id = State()
+    waiting_for_channel_remove = State()
+
+class CategoryStates(StatesGroup):
+    waiting_for_category_name = State()
+    waiting_for_category_name_ar = State()
+    waiting_for_category_id = State()
+    waiting_for_edit_category_id = State()
+    waiting_for_edit_category_field = State()
+    waiting_for_edit_category_value = State()
+
+class AuthorStates(StatesGroup):
+    waiting_for_author_name = State()
+    waiting_for_author_bio = State()
+    waiting_for_author_id = State()
+    waiting_for_edit_author_id = State()
+    waiting_for_edit_author_field = State()
+    waiting_for_edit_author_value = State()
+
+class UserManagementStates(StatesGroup):
+    waiting_for_user_id_to_ban = State()
+    waiting_for_ban_reason = State()
+    waiting_for_user_id_to_unban = State()
+    waiting_for_message_user_id = State()
+    waiting_for_message_text = State()
+    waiting_for_broadcast_text = State()
+
+class AIFindStates(StatesGroup):
+    waiting_for_description = State()
+    choosing_category = State()
+    choosing_author = State()
+    waiting_for_new_author = State()
+
+class UploadStates(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_title = State()
+    waiting_for_author = State()
+    waiting_for_category = State()
+    waiting_for_description = State()
+
+# ---------- دوال مساعدة ----------
+def is_owner(telegram_id: int) -> bool:
+    return telegram_id == settings.telegram_admin_id
+
+async def show_profile_logic(message: Message):
+    try:
+        user = message.from_user
+        with get_db_context() as db:
+            user_service = UserService(db)
+            db_user = await user_service.get_user_by_telegram_id(str(user.id))
+            if db_user:
+                text = (
+                    f"👤 ملفك الشخصي:\n\n"
+                    f"الاسم: {db_user.get_full_name()}\n"
+                    f"المستوى: {db_user.level}\n"
+                    f"التحميلات: {db_user.total_downloads}\n"
+                    f"الكتب المقروءة: {db_user.total_books_read}\n"
+                    f"الحالة: {'🟢 مشترك' if db_user.is_premium else '⚪ عضو عادي'}"
+                )
+                await message.answer(text)
+            else:
+                await message.answer("لم نتمكن من العثور على بيانات ملفك الشخصي.")
+    except Exception as e:
+        logger.error(f"Error showing profile: {str(e)}")
+        await message.answer("حدث خطأ. يرجى المحاولة لاحقاً.")
+
+async def show_points_logic(message: Message):
+    try:
+        user = message.from_user
+        with get_db_context() as db:
+            user_service = UserService(db)
+            db_user = await user_service.get_user_by_telegram_id(str(user.id))
+            if db_user:
+                points_service = PointsService(db)
+                user_points = await points_service.get_user_points(db_user.id)
+                if user_points:
+                    text = (
+                        f"🎁 نقاطك:\n\n"
+                        f"إجمالي النقاط: {user_points.total_points} 🏆\n"
+                        f"النقاط المتاحة: {user_points.available_points} ✨\n"
+                        f"النقاط المستخدمة: {user_points.used_points} 📊"
+                    )
+                    await message.answer(text)
+                else:
+                    await message.answer("لم نتمكن من العثور على نقاطك.")
+            else:
+                await message.answer("لم نتمكن من العثور على بيانات حسابك.")
+    except Exception as e:
+        logger.error(f"Error showing points: {str(e)}")
+        await message.answer("حدث خطأ. يرجى المحاولة لاحقاً.")
+
+# ---------- Middleware الاشتراك الإجباري ----------
+class ForceJoinMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: Dict[str, Any]
+    ) -> Any:
+        if isinstance(event, CallbackQuery):
+            if not event.from_user:
+                return await handler(event, data)
+            if is_owner(event.from_user.id):
+                return await handler(event, data)
+            bot = data['bot']
+            with get_db_context() as db:
+                service = ChannelService(db)
+                is_sub, missing = await service.check_subscription(bot, event.from_user.id)
+                if not is_sub and missing:
+                    await event.answer(
+                        f"⚠️ يجب الاشتراك في القناة التالية أولاً:\n{missing.channel_id}\n\n"
+                        "اشترك ثم أعد المحاولة.",
+                        show_alert=True
+                    )
+                    return
+            return await handler(event, data)
+
+        if not event.from_user:
+            return await handler(event, data)
+
+        if is_owner(event.from_user.id):
+            return await handler(event, data)
+
+        if event.text and event.text.startswith('/start'):
+            return await handler(event, data)
+
+        bot = data['bot']
+        with get_db_context() as db:
+            service = ChannelService(db)
+            is_sub, missing = await service.check_subscription(bot, event.from_user.id)
+            if not is_sub and missing:
+                await event.answer(
+                    f"⚠️ يجب الاشتراك في القناة التالية أولاً:\n{missing.channel_id}\n\n"
+                    "اشترك ثم أعد المحاولة."
+                )
+                return
+
+        return await handler(event, data)
+
+router.message.middleware(ForceJoinMiddleware())
+router.callback_query.middleware(ForceJoinMiddleware())
+
+# ---------- الأوامر الأساسية ----------
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    await show_profile_logic(message)
+
+@router.message(Command("points"))
+async def cmd_points(message: Message):
+    await show_points_logic(message)
+
+@router.message(Command("trending"))
+async def cmd_trending(message: Message):
+    with get_db_context() as db:
+        book_service = BookService(db)
+        books = await book_service.get_trending_books(5)
+        if books:
+            text = "🔥 **الكتب الرائجة**\n\n"
+            for i, book in enumerate(books, 1):
+                text += f"{i}. {book.title} - {book.author}\n"
+            await message.answer(text)
+        else:
+            await message.answer("لا توجد كتب رائجة حالياً.")
+
+@router.message(Command("featured"))
+async def cmd_featured(message: Message):
+    with get_db_context() as db:
+        book_service = BookService(db)
+        books = await book_service.get_featured_books(5)
+        if books:
+            text = "⭐ **الكتب المميزة**\n\n"
+            for i, book in enumerate(books, 1):
+                text += f"{i}. {book.title} - {book.author}\n"
+            await message.answer(text)
+        else:
+            await message.answer("لا توجد كتب مميزة حالياً.")
+
+# ---------- البحث ----------
+@router.message(Command("search"))
+async def cmd_search(message: Message, state: FSMContext):
+    await message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
+    await state.set_state(SearchStates.waiting_for_query)
+
+@router.message(F.text == "🔍 بحث")
+async def search_button(message: Message, state: FSMContext):
+    await message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
+    await state.set_state(SearchStates.waiting_for_query)
+
+@router.message(SearchStates.waiting_for_query)
+async def process_query(message: Message, state: FSMContext):
+    query = message.text.strip()
+    if not query:
+        await message.answer("يرجى كتابة كلمة بحث صحيحة.")
+        return
+    await state.update_data(query=query)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 بحث نصي", callback_data="search_text")],
+        [InlineKeyboardButton(text="🧠 بحث دلالي (AI)", callback_data="search_semantic")],
+        [InlineKeyboardButton(text="🔙 إلغاء", callback_data="search_cancel")]
+    ])
+    await message.answer("اختر نوع البحث:", reply_markup=keyboard)
+    await state.set_state(SearchStates.choosing_search_type)
+
+@router.callback_query(SearchStates.choosing_search_type, F.data.startswith("search_"))
+async def perform_search(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    query = data.get("query", "")
+    search_type = callback.data
+
+    if search_type == "search_cancel":
+        await callback.message.answer("تم إلغاء البحث.")
+        await callback.answer()
+        await state.clear()
+        return
+
+    with get_db_context() as db:
+        search_service = SearchService(db)
+        if search_type == "search_text":
+            books = await search_service.text_search(query, limit=5)
+        else:
+            books = await search_service.semantic_search(query, limit=5)
+
+    if books:
+        text = f"📚 **نتائج البحث عن '{query}'**\n\n"
+        for i, book in enumerate(books, 1):
+            text += f"{i}. {book.title} - {book.author}\n"
+        text += "\nلتحميل كتاب، أرسل /get متبوعاً برقم الكتاب"
+        await callback.message.answer(text)
+    else:
+        await callback.message.answer("🔍 لم يتم العثور على كتب تطابق بحثك.")
+
+    await callback.answer()
+    await state.clear()
+
+# ---------- تصفح الأقسام (ديناميكي) ----------
+@router.message(F.text == "📚 تصفح الكتب")
+async def browse_books(message: Message):
+    await message.answer("اختر القسم الذي تريد تصفحه:", reply_markup=await get_category_keyboard())
+
+@router.callback_query(F.data.startswith("cat_"))
+async def handle_category(callback: CallbackQuery):
+    try:
+        cat_id_str = callback.data.replace("cat_", "")
+        if not cat_id_str.isdigit():
+            await callback.message.answer("قسم غير صالح.")
+            await callback.answer()
+            return
+        cat_id = int(cat_id_str)
+
+        with get_db_context() as db:
+            category = db.query(BookCategory).filter(BookCategory.id == cat_id).first()
+            if not category:
+                await callback.message.answer("القسم غير موجود حالياً.")
+                await callback.answer()
+                return
+
+            books = db.query(Book).filter(
+                Book.category_id == category.id,
+                Book.status == BookStatus.ACTIVE
+            ).order_by(Book.created_at.desc()).limit(10).all()
+
+            cat_display = category.name_ar or category.name
+            if books:
+                text = f"📚 **كتب قسم {cat_display}**\n\n"
+                for i, book in enumerate(books, 1):
+                    text += f"{i}. {book.title} - {book.author}\n"
+                text += "\nلتحميل كتاب، أرسل /get متبوعاً برقم الكتاب"
+                await callback.message.answer(text)
+            else:
+                await callback.message.answer(f"لا توجد كتب في قسم {cat_display} حالياً.")
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error in handle_category: {str(e)}")
+        await callback.answer("حدث خطأ، حاول لاحقاً.")
+
+@router.callback_query(F.data == "back")
+async def handle_back(callback: CallbackQuery):
+    try:
+        await callback.message.answer("العودة إلى القائمة الرئيسية:", reply_markup=get_main_keyboard())
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error in handle_back: {str(e)}")
+        await callback.answer("حدث خطأ")
+
+# ---------- أزرار الملف الشخصي والنقاط ----------
+@router.message(F.text == "👤 ملفي الشخصي")
+async def button_profile(message: Message):
+    await show_profile_logic(message)
+
+@router.message(F.text == "🎁 نقاطي")
+async def button_points(message: Message):
+    await show_points_logic(message)
+
+# ---------- لوحة الأوامر التفاعلية ----------
+@router.callback_query(F.data == "cmd_profile")
+async def inline_profile(callback: CallbackQuery):
+    await show_profile_logic(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_points")
+async def inline_points(callback: CallbackQuery):
+    await show_points_logic(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_trending")
+async def inline_trending(callback: CallbackQuery):
+    with get_db_context() as db:
+        book_service = BookService(db)
+        books = await book_service.get_trending_books(5)
+        if books:
+            text = "🔥 **الكتب الرائجة**\n\n"
+            for i, book in enumerate(books, 1):
+                text += f"{i}. {book.title} - {book.author}\n"
+            await callback.message.answer(text)
+        else:
+            await callback.message.answer("لا توجد كتب رائجة حالياً.")
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_featured")
+async def inline_featured(callback: CallbackQuery):
+    with get_db_context() as db:
+        book_service = BookService(db)
+        books = await book_service.get_featured_books(5)
+        if books:
+            text = "⭐ **الكتب المميزة**\n\n"
+            for i, book in enumerate(books, 1):
+                text += f"{i}. {book.title} - {book.author}\n"
+            await callback.message.answer(text)
+        else:
+            await callback.message.answer("لا توجد كتب مميزة حالياً.")
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_search")
+async def inline_search(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
+    await state.set_state(SearchStates.waiting_for_query)
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_help")
+async def inline_help(callback: CallbackQuery):
+    help_text = (
+        "📚 **مساعدة - مكتبة الكتب الذكية**\n\n"
+        "الأوامر المتاحة:\n"
+        "/start - بدء التطبيق\n"
+        "/help - عرض المساعدة\n"
+        "👤 ملفي الشخصي - معلوماتك\n"
+        "🎁 نقاطي - مجموع نقاطك\n"
+        "🔥 الكتب الرائجة - الأكثر تحميلاً\n"
+        "⭐ الكتب المميزة - المختارة يدوياً\n"
+        "🔍 بحث - ابحث عن أي كتاب\n"
+        "📚 تصفح الكتب - تصفح الأقسام\n"
+        "/favorites - المفضلة\n"
+        "/history - سجل التحميلات"
+    )
+    await callback.message.answer(help_text)
+    await callback.answer()
+
+@router.message(Command("commands"))
+@router.message(F.text == "📋 الأوامر")
+async def show_commands(message: Message):
+    await message.answer("اختر الأمر الذي تريد:", reply_markup=get_commands_inline_keyboard())
+
+# ---------- رفع الكتب (/upload) ----------
+@router.message(Command("upload"))
+async def cmd_upload(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📎 أرسل ملف الكتاب (PDF/EPUB/TXT):")
+    await state.set_state(UploadStates.waiting_for_file)
+
+@router.message(UploadStates.waiting_for_file, F.document)
+async def process_upload_file(message: Message, state: FSMContext):
+    document = message.document
+    file_name = document.file_name
+    allowed_exts = settings.allowed_file_types.split(",")
+    ext = file_name.rsplit(".", 1)[-1].lower()
+    if ext not in allowed_exts:
+        await message.answer(f"❌ الملف غير مسموح. الأنواع المسموحة: {settings.allowed_file_types}")
+        return
+    os.makedirs("uploads", exist_ok=True)
+    file_path = f"uploads/{file_name}"
+    await message.bot.download(file=document, destination=file_path)
+    await state.update_data(file_path=file_path)
+    await message.answer("📝 أرسل عنوان الكتاب:")
+    await state.set_state(UploadStates.waiting_for_title)
+
+@router.message(UploadStates.waiting_for_title)
+async def process_upload_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await message.answer("✍️ أرسل اسم المؤلف:")
+    await state.set_state(UploadStates.waiting_for_author)
+
+@router.message(UploadStates.waiting_for_author)
+async def process_upload_author(message: Message, state: FSMContext):
+    await state.update_data(author=message.text.strip())
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            await state.update_data(category_id=None)
+            await message.answer("📄 أرسل وصف الكتاب (أو /skip):")
+            await state.set_state(UploadStates.waiting_for_description)
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=c.name, callback_data=f"upcat_{c.id}")] for c in cats
+            ])
+            await message.answer("📁 اختر القسم:", reply_markup=keyboard)
+            await state.set_state(UploadStates.waiting_for_category)
+
+@router.callback_query(UploadStates.waiting_for_category, F.data.startswith("upcat_"))
+async def process_upload_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.replace("upcat_", ""))
+    await state.update_data(category_id=cat_id)
+    await callback.message.answer("📄 أرسل وصف الكتاب (أو /skip):")
+    await state.set_state(UploadStates.waiting_for_description)
+    await callback.answer()
+
+@router.message(UploadStates.waiting_for_description)
+async def process_upload_description(message: Message, state: FSMContext):
+    desc = message.text.strip() if message.text != "/skip" else ""
+    data = await state.get_data()
+    with get_db_context() as db:
+        book = Book(
+            title=data['title'],
+            author=data['author'],
+            description=desc,
+            category_id=data.get('category_id'),
+            file_path=data['file_path'],
+            status=BookStatus.PENDING
+        )
+        db.add(book)
+        db.commit()
+        await message.answer(f"✅ تم رفع الكتاب '{book.title}' وهو قيد المراجعة.")
+    await state.clear()
+
+# ---------- المفضلة والسجل ----------
+@router.message(Command("favorites"))
+async def cmd_favorites(message: Message):
+    user_id = message.from_user.id
+    with get_db_context() as db:
+        favs = db.query(Favorite).filter_by(user_id=user_id).all()
+        if not favs:
+            return await message.answer("لم تضف أي كتب إلى المفضلة.")
+        text = "❤️ **المفضلة**\n\n"
+        for f in favs:
+            text += f"• {f.book.title} - {f.book.author}\n"
+        await message.answer(text)
+
+@router.message(Command("history"))
+async def cmd_history(message: Message):
+    user_id = message.from_user.id
+    with get_db_context() as db:
+        hist = db.query(DownloadHistory).filter_by(user_id=user_id).order_by(DownloadHistory.downloaded_at.desc()).limit(10).all()
+        if not hist:
+            return await message.answer("لا يوجد سجل تحميلات.")
+        text = "📥 **آخر التحميلات**\n\n"
+        for h in hist:
+            text += f"• {h.book.title} - {h.downloaded_at.strftime('%Y-%m-%d')}\n"
+        await message.answer(text)
+
+@router.callback_query(F.data.startswith("fav_"))
+async def toggle_favorite(callback: CallbackQuery):
+    book_id = int(callback.data.replace("fav_", ""))
+    user_id = callback.from_user.id
+    with get_db_context() as db:
+        exists = db.query(Favorite).filter_by(user_id=user_id, book_id=book_id).first()
+        if exists:
+            db.delete(exists)
+            await callback.answer("تمت إزالة الكتاب من المفضلة", show_alert=True)
+        else:
+            db.add(Favorite(user_id=user_id, book_id=book_id))
+            await callback.answer("تمت إضافة الكتاب إلى المفضلة", show_alert=True)
+        db.commit()
+
+# ---------- التقييمات ----------
+@router.callback_query(F.data.startswith("rate_"))
+async def handle_rate_book(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer("بيانات غير صحيحة")
+        return
+    try:
+        rating = int(parts[1])
+        book_id = int(parts[2])
+    except ValueError:
+        await callback.answer("خطأ في البيانات")
+        return
+    if not 1 <= rating <= 5:
+        await callback.answer("تقييم غير صالح")
+        return
+    user_id = callback.from_user.id
+    with get_db_context() as db:
+        book_service = BookService(db)
+        await book_service.add_rating(book_id, user_id, rating)
+        await callback.answer("تم تسجيل تقييمك، شكراً!", show_alert=True)
+
+# ---------- إصلاح الإعدادات ----------
+@router.message(F.text == "🌐 اللغة")
+async def settings_language(message: Message):
+    await message.answer("الإعدادات اللغوية قيد التطوير.")
+
+@router.message(F.text == "🔔 الإشعارات")
+async def settings_notifications(message: Message):
+    await message.answer("إعدادات الإشعارات قيد التطوير.")
+
+@router.message(F.text == "🔐 الخصوصية")
+async def settings_privacy(message: Message):
+    await message.answer("إعدادات الخصوصية قيد التطوير.")
+
+@router.message(F.text == "ℹ️ حول التطبيق")
+async def settings_about(message: Message):
+    await message.answer("مكتبة الكتب الذكية - الإصدار 1.0")
+
+# ---------- دوال العرض التفاعلي للوحات الإدارة ----------
+async def show_categories_panel(message: Message, user_id: int):
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ إضافة قسم", callback_data="admin_cat_add")],
+        [InlineKeyboardButton(text="❌ حذف قسم", callback_data="admin_cat_delete")],
+        [InlineKeyboardButton(text="✏️ تعديل قسم", callback_data="admin_cat_edit")],
+        [InlineKeyboardButton(text="📋 عرض الأقسام", callback_data="admin_cat_list")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="owner_main")]
+    ])
+    await message.answer("📁 **إدارة الأقسام**", reply_markup=keyboard)
+
+async def show_authors_panel(message: Message, user_id: int):
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ إضافة مؤلف", callback_data="admin_auth_add")],
+        [InlineKeyboardButton(text="❌ حذف مؤلف", callback_data="admin_auth_delete")],
+        [InlineKeyboardButton(text="✏️ تعديل مؤلف", callback_data="admin_auth_edit")],
+        [InlineKeyboardButton(text="📋 عرض المؤلفين", callback_data="admin_auth_list")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="owner_main")]
+    ])
+    await message.answer("✍️ **إدارة المؤلفين**", reply_markup=keyboard)
+
+async def show_channels_panel(message: Message, user_id: int):
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ إضافة قناة", callback_data="admin_ch_add")],
+        [InlineKeyboardButton(text="❌ حذف قناة", callback_data="admin_ch_remove")],
+        [InlineKeyboardButton(text="📋 عرض القنوات", callback_data="admin_ch_list")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="owner_main")]
+    ])
+    await message.answer("📡 **إدارة القنوات الإجبارية**", reply_markup=keyboard)
+
+async def show_users_panel(message: Message, user_id: int):
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 حظر مستخدم", callback_data="user_ban")],
+        [InlineKeyboardButton(text="✅ فك حظر", callback_data="user_unban")],
+        [InlineKeyboardButton(text="👥 عرض كل المستخدمين", callback_data="user_list")],
+        [InlineKeyboardButton(text="📩 رسالة لمستخدم", callback_data="user_msg")],
+        [InlineKeyboardButton(text="📣 رسالة للجميع", callback_data="user_broadcast")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="owner_main")]
+    ])
+    await message.answer("👥 **إدارة المستخدمين**", reply_markup=keyboard)
+
+# ---------- معالجات أزرار اللوحات ----------
+# العودة للقائمة الرئيسية
+@router.callback_query(F.data == "owner_main")
+async def back_to_owner_main(callback: CallbackQuery):
+    await cmd_admin_panel(callback.message)
+    await callback.answer()
+
+# --- الأقسام ---
+@router.callback_query(F.data == "owner_categories")
+async def owner_categories(callback: CallbackQuery):
+    await show_categories_panel(callback.message, callback.from_user.id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_cat_add")
+async def cat_add_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل اسم القسم (عربي أو إنجليزي):")
+    await state.set_state(CategoryStates.waiting_for_category_name)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_cat_delete")
+async def cat_delete_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل ID القسم الذي تريد حذفه:")
+    await state.set_state(CategoryStates.waiting_for_category_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_cat_edit")
+async def cat_edit_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل ID القسم الذي تريد تعديله:")
+    await state.set_state(CategoryStates.waiting_for_edit_category_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_cat_list")
+async def cat_list(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await cmd_listcategories(callback.message)
+    await callback.answer()
+
+# --- المؤلفين ---
+@router.callback_query(F.data == "owner_authors")
+async def owner_authors(callback: CallbackQuery):
+    await show_authors_panel(callback.message, callback.from_user.id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_auth_add")
+async def auth_add_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل اسم المؤلف:")
+    await state.set_state(AuthorStates.waiting_for_author_name)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_auth_delete")
+async def auth_delete_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل ID المؤلف الذي تريد حذفه:")
+    await state.set_state(AuthorStates.waiting_for_author_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_auth_edit")
+async def auth_edit_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل ID المؤلف الذي تريد تعديله:")
+    await state.set_state(AuthorStates.waiting_for_edit_author_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_auth_list")
+async def auth_list(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await cmd_listauthors(callback.message)
+    await callback.answer()
+
+# --- القنوات ---
+@router.callback_query(F.data == "owner_channels")
+async def owner_channels(callback: CallbackQuery):
+    await show_channels_panel(callback.message, callback.from_user.id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_ch_add")
+async def ch_add_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("📡 أرسل معرف القناة (مثال: @MyChannel):")
+    await state.set_state(ChannelStates.waiting_for_channel_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_ch_remove")
+async def ch_remove_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("📡 أرسل معرف القناة التي تريد حذفها:")
+    await state.set_state(ChannelStates.waiting_for_channel_remove)
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_ch_list")
+async def ch_list(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await cmd_list_channels(callback.message)
+    await callback.answer()
+
+# --- المستخدمين ---
+@router.callback_query(F.data == "owner_users")
+async def owner_users(callback: CallbackQuery):
+    await show_users_panel(callback.message, callback.from_user.id)
+    await callback.answer()
+
+@router.callback_query(F.data == "user_ban")
+async def user_ban_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("📍 أرسل ID المستخدم الذي تريد حظره:")
+    await state.set_state(UserManagementStates.waiting_for_user_id_to_ban)
+    await callback.answer()
+
+@router.callback_query(F.data == "user_unban")
+async def user_unban_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("📍 أرسل ID المستخدم لفك الحظر:")
+    await state.set_state(UserManagementStates.waiting_for_user_id_to_unban)
+    await callback.answer()
+
+@router.callback_query(F.data == "user_list")
+async def user_list(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    with get_db_context() as db:
+        users = db.query(User).order_by(User.id).limit(20).all()
+        if not users:
+            await callback.message.answer("لا يوجد مستخدمين.")
+        else:
+            text = "👥 **قائمة المستخدمين**\n\n"
+            for u in users:
+                text += f"• {u.get_full_name()} (ID: {u.id}, @{u.username or 'لا يوجد'})\n"
+            await callback.message.answer(text)
+    await callback.answer()
+
+@router.callback_query(F.data == "user_msg")
+async def user_msg_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل ID المستخدم الذي تريد مراسلته:")
+    await state.set_state(UserManagementStates.waiting_for_message_user_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "user_broadcast")
+async def user_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل الرسالة التي تريد إرسالها للجميع:")
+    await state.set_state(UserManagementStates.waiting_for_broadcast_text)
+    await callback.answer()
+
+# ---------- تنفيذ أوامر المستخدمين (حظر/فك/رسالة) ----------
+@router.message(UserManagementStates.waiting_for_user_id_to_ban)
+async def process_ban_user_id(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ يجب إرسال رقم صحيح.")
+        return
+    user_id = int(message.text)
+    await state.update_data(user_id=user_id)
+    await message.answer("✏️ اكتب سبب الحظر (أو أرسل 'تخطي'):")
+    await state.set_state(UserManagementStates.waiting_for_ban_reason)
+
+@router.message(UserManagementStates.waiting_for_ban_reason)
+async def process_ban_reason(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get('user_id')
+    reason = message.text if message.text != 'تخطي' else ""
+    with get_db_context() as db:
+        service = AdminService(db)
+        success = await service.ban_user(user_id, settings.telegram_admin_id, reason)
+        if success:
+            await message.answer(f"✅ تم حظر المستخدم {user_id}")
+        else:
+            await message.answer("❌ فشل حظر المستخدم. تأكد من صحة ID.")
+    await state.clear()
+
+@router.message(UserManagementStates.waiting_for_user_id_to_unban)
+async def process_unban(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ يجب إرسال رقم صحيح.")
+        return
+    user_id = int(message.text)
+    with get_db_context() as db:
+        service = AdminService(db)
+        success = await service.unban_user(user_id, settings.telegram_admin_id)
+        if success:
+            await message.answer(f"✅ تم فك حظر المستخدم {user_id}")
+        else:
+            await message.answer("❌ فشل فك الحظر. تأكد من صحة ID.")
+    await state.clear()
+
+@router.message(UserManagementStates.waiting_for_message_user_id)
+async def process_msg_user_id(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ يجب إرسال رقم صحيح.")
+        return
+    user_id = int(message.text)
+    await state.update_data(msg_user_id=user_id)
+    await message.answer("أرسل نص الرسالة:")
+    await state.set_state(UserManagementStates.waiting_for_message_text)
+
+@router.message(UserManagementStates.waiting_for_message_text)
+async def send_msg_to_user(message: Message, state: FSMContext, bot):
+    data = await state.get_data()
+    user_id = data.get('msg_user_id')
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            await message.answer("المستخدم غير موجود.")
+            await state.clear()
+            return
+        try:
+            await bot.send_message(chat_id=user.telegram_id, text=message.text)
+            await message.answer(f"✅ تم إرسال الرسالة إلى {user.get_full_name()}")
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+            await message.answer("❌ فشل إرسال الرسالة. قد يكون المستخدم لم يبدأ البوت.")
+    await state.clear()
+
+@router.message(UserManagementStates.waiting_for_broadcast_text)
+async def send_broadcast(message: Message, state: FSMContext, bot):
+    text = message.text
+    with get_db_context() as db:
+        users = db.query(User).all()
+        success_count = 0
+        fail_count = 0
+        for user in users:
+            try:
+                await bot.send_message(chat_id=user.telegram_id, text=text)
+                success_count += 1
+            except:
+                fail_count += 1
+    await message.answer(f"📣 تم الإرسال إلى {success_count} مستخدم. فشل لـ {fail_count}.")
+    await state.clear()
+
+# ---------- أوامر الاشتراك الإجباري (للمالك فقط) ----------
+@router.message(Command("addchannel"))
+async def cmd_add_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📡 أرسل معرف القناة (مثال: @MyChannel):")
+    await state.set_state(ChannelStates.waiting_for_channel_id)
+
+@router.message(ChannelStates.waiting_for_channel_id)
+async def process_channel_id(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    if not channel_id.startswith("@"):
+        return await message.answer("يجب أن يبدأ المعرف بـ @")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        success = await service.add_channel(channel_id)
+        if success:
+            await message.answer(f"✅ تمت إضافة القناة {channel_id} للاشتراك الإجباري")
+        else:
+            await message.answer("❌ فشلت الإضافة، قد تكون القناة مكررة")
+    await state.clear()
+
+@router.message(Command("removechannel"))
+async def cmd_remove_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📡 أرسل معرف القناة التي تريد حذفها:")
+    await state.set_state(ChannelStates.waiting_for_channel_remove)
+
+@router.message(ChannelStates.waiting_for_channel_remove)
+async def process_remove_channel(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    with get_db_context() as db:
+        service = ChannelService(db)
+        if await service.remove_channel(channel_id):
+            await message.answer(f"✅ تم حذف القناة {channel_id}")
+        else:
+            await message.answer("❌ القناة غير موجودة في القائمة")
+    await state.clear()
+
+@router.message(Command("listchannels"))
+async def cmd_list_channels(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        channels = await service.get_all_channels()
+        if not channels:
+            return await message.answer("لا توجد قنوات اشتراك إجباري حالياً")
+        text = "📋 **قنوات الاشتراك الإجباري**\n\n"
+        for ch in channels:
+            text += f"• {ch.channel_id} {'✅ إجباري' if ch.is_required else '🟡 اختياري'}\n"
+        await message.answer(text)
+
+# ---------- إدارة الأقسام (أوامر النصية الأصلية) ----------
+@router.message(Command("addcategory"))
+async def cmd_addcategory(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل اسم القسم (عربي أو إنجليزي):")
+    await state.set_state(CategoryStates.waiting_for_category_name)
+
+@router.message(CategoryStates.waiting_for_category_name)
+async def process_cat_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("أرسل الاسم العربي للقسم (أو ارسل 'تخطي'):")
+    await state.set_state(CategoryStates.waiting_for_category_name_ar)
+
+@router.message(CategoryStates.waiting_for_category_name_ar)
+async def process_cat_name_ar(message: Message, state: FSMContext):
+    name_ar = message.text.strip()
+    if name_ar == 'تخطي':
+        name_ar = None
+    data = await state.get_data()
+    with get_db_context() as db:
+        service = CategoryService(db)
+        cat = await service.create(name=data['name'], name_ar=name_ar)
+        if cat:
+            await message.answer(f"✅ تم إنشاء القسم '{cat.name}'")
+        else:
+            await message.answer("❌ فشل في إنشاء القسم")
+    await state.clear()
+
+@router.message(Command("deletecategory"))
+async def cmd_deletecategory(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل ID القسم الذي تريد حذفه:")
+    await state.set_state(CategoryStates.waiting_for_category_id)
+
+@router.message(CategoryStates.waiting_for_category_id)
+async def process_delete_category(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("يجب إرسال رقم صحيح")
+    cat_id = int(message.text)
+    with get_db_context() as db:
+        service = CategoryService(db)
+        if await service.delete(cat_id):
+            await message.answer("✅ تم الحذف")
+        else:
+            await message.answer("❌ القسم غير موجود")
+    await state.clear()
+
+@router.message(Command("listcategories"))
+async def cmd_listcategories(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            return await message.answer("لا توجد أقسام")
+        text = "📁 **الأقسام**\n\n"
+        for c in cats:
+            text += f"• {c.name} (ID: {c.id})\n"
+        await message.answer(text)
+
+# تعديل قسم
+@router.message(CategoryStates.waiting_for_edit_category_id)
+async def process_edit_category_id(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ رقم غير صحيح")
+        return
+    cat_id = int(message.text)
+    await state.update_data(edit_cat_id=cat_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="الاسم (إنجليزي)", callback_data="edit_cat_name")],
+        [InlineKeyboardButton(text="الاسم العربي", callback_data="edit_cat_name_ar")]
+    ])
+    await message.answer("اختر الحقل المراد تعديله:", reply_markup=keyboard)
+    await state.set_state(CategoryStates.waiting_for_edit_category_field)
+
+@router.callback_query(CategoryStates.waiting_for_edit_category_field)
+async def choose_edit_cat_field(callback: CallbackQuery, state: FSMContext):
+    field = callback.data.replace("edit_cat_", "")
+    await state.update_data(edit_cat_field=field)
+    await callback.message.answer(f"أرسل القيمة الجديدة لـ '{field}':")
+    await state.set_state(CategoryStates.waiting_for_edit_category_value)
+    await callback.answer()
+
+@router.message(CategoryStates.waiting_for_edit_category_value)
+async def update_category_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cat_id = data.get('edit_cat_id')
+    field = data.get('edit_cat_field')
+    value = message.text.strip()
+    with get_db_context() as db:
+        service = CategoryService(db)
+        if field == "name":
+            await service.update(cat_id, name=value)
+        elif field == "name_ar":
+            await service.update(cat_id, name_ar=value)
+        await message.answer("✅ تم التعديل بنجاح.")
+    await state.clear()
+
+# ---------- إدارة المؤلفين (أوامر النصية الأصلية) ----------
+@router.message(Command("addauthor"))
+async def cmd_addauthor(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل اسم المؤلف:")
+    await state.set_state(AuthorStates.waiting_for_author_name)
+
+@router.message(AuthorStates.waiting_for_author_name)
+async def process_author_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("أرسل نبذة عن المؤلف (أو 'تخطي'):")
+    await state.set_state(AuthorStates.waiting_for_author_bio)
+
+@router.message(AuthorStates.waiting_for_author_bio)
+async def process_author_bio(message: Message, state: FSMContext):
+    bio = message.text.strip()
+    if bio == 'تخطي':
+        bio = None
+    data = await state.get_data()
+    with get_db_context() as db:
+        service = AuthorService(db)
+        author = await service.create(name=data['name'], bio=bio)
+        await message.answer(f"✅ تم إضافة المؤلف '{author.name}'")
+    await state.clear()
+
+@router.message(Command("deleteauthor"))
+async def cmd_deleteauthor(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل ID المؤلف:")
+    await state.set_state(AuthorStates.waiting_for_author_id)
+
+@router.message(AuthorStates.waiting_for_author_id)
+async def process_delete_author(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("يجب أن يكون رقماً")
+    author_id = int(message.text)
+    with get_db_context() as db:
+        if await AuthorService(db).delete(author_id):
+            await message.answer("✅ تم حذف المؤلف")
+        else:
+            await message.answer("❌ المؤلف غير موجود")
+    await state.clear()
+
+@router.message(Command("listauthors"))
+async def cmd_listauthors(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        authors = await AuthorService(db).list_all()
+        if not authors:
+            return await message.answer("لا يوجد مؤلفون")
+        text = "✍️ **المؤلفون**\n\n"
+        for a in authors:
+            text += f"• {a.name} (ID: {a.id})\n"
+        await message.answer(text)
+
+# تعديل مؤلف
+@router.message(AuthorStates.waiting_for_edit_author_id)
+async def process_edit_author_id(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ رقم غير صحيح")
+        return
+    author_id = int(message.text)
+    await state.update_data(edit_author_id=author_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="الاسم", callback_data="edit_auth_name")],
+        [InlineKeyboardButton(text="النبذة", callback_data="edit_auth_bio")]
+    ])
+    await message.answer("اختر الحقل المراد تعديله:", reply_markup=keyboard)
+    await state.set_state(AuthorStates.waiting_for_edit_author_field)
+
+@router.callback_query(AuthorStates.waiting_for_edit_author_field)
+async def choose_edit_auth_field(callback: CallbackQuery, state: FSMContext):
+    field = callback.data.replace("edit_auth_", "")
+    await state.update_data(edit_auth_field=field)
+    await callback.message.answer(f"أرسل القيمة الجديدة لـ '{field}':")
+    await state.set_state(AuthorStates.waiting_for_edit_author_value)
+    await callback.answer()
+
+@router.message(AuthorStates.waiting_for_edit_author_value)
+async def update_author_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    author_id = data.get('edit_author_id')
+    field = data.get('edit_auth_field')
+    value = message.text.strip()
+    with get_db_context() as db:
+        service = AuthorService(db)
+        if field == "name":
+            await service.update(author_id, name=value)
+        elif field == "bio":
+            await service.update(author_id, bio=value)
+        await message.answer("✅ تم التعديل بنجاح.")
+    await state.clear()
+
+# ---------- أمر الذكاء الاصطناعي: /aifind ----------
+@router.message(Command("aifind"))
+async def cmd_aifind_message(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("اكتب وصفًا للكتاب الذي تريد البحث عنه (مثلاً: 'كتاب عن تعلم الآلة بالعربية'):")
+    await state.set_state(AIFindStates.waiting_for_description)
+
+@router.callback_query(F.data == "owner_aifind")
+async def owner_aifind_callback(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("اكتب وصفًا للكتاب الذي تريد البحث عنه:")
+    await state.set_state(AIFindStates.waiting_for_description)
+    await callback.answer()
+
+@router.message(AIFindStates.waiting_for_description)
+async def process_ai_description(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("❌ غير مصرح")
+        await state.clear()
+        return
+
+    await state.update_data(desc=message.text.strip())
+    await message.answer("جاري البحث بواسطة الذكاء الاصطناعي...")
+    ai_service = AIService()
+    suggested = await ai_service.classify_book(
+        title="عنوان مقترح",
+        description=message.text.strip(),
+        author="مؤلف مقترح"
+    )
+    if not suggested:
+        await message.answer("فشل الاتصال بالذكاء الاصطناعي. تأكد من المفاتيح أو حاول لاحقًا.")
+        await state.clear()
+        return
+
+    await state.update_data(
+        book_title="عنوان مقترح من AI",
+        book_author="مؤلف مقترح من AI",
+        book_desc=message.text.strip()
+    )
+    text = (
+        f"🤖 **اقتراح الكتاب**\n\n"
+        f"📖 العنوان: {suggested.get('title', 'غير معروف')}\n"
+        f"✍️ المؤلف: {suggested.get('author', 'غير معروف')}\n"
+        f"📝 التصنيف: {suggested.get('category', 'غير معروف')}\n"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ إضافة فعليًا", callback_data="aifind_confirm")],
+        [InlineKeyboardButton(text="❌ تجاهل", callback_data="aifind_cancel")]
+    ])
+    await message.answer(text, reply_markup=keyboard)
+    await state.set_state(AIFindStates.choosing_category)
+
+@router.callback_query(AIFindStates.choosing_category, F.data == "aifind_confirm")
+async def aifind_choose_category(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            await callback.message.answer("لا توجد أقسام. قم بإنشاء قسم أولاً.")
+            return
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=c.name, callback_data=f"aicat_{c.id}")] for c in cats
+        ])
+    await callback.message.answer("اختر قسمًا للكتاب:", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("aicat_"))
+async def aifind_set_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.replace("aicat_", ""))
+    await state.update_data(cat_id=cat_id)
+    with get_db_context() as db:
+        authors = await AuthorService(db).list_all()
+        if not authors:
+            await callback.message.answer("لا يوجد مؤلفون. أرسل اسم المؤلف الجديد:")
+            await state.set_state(AIFindStates.waiting_for_new_author)
+            await callback.answer()
+            return
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=a.name, callback_data=f"aiauth_{a.id}")] for a in authors
+        ])
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="إنشاء مؤلف جديد", callback_data="aiauth_new")])
+    await callback.message.answer("اختر المؤلف:", reply_markup=keyboard)
+    await state.set_state(AIFindStates.choosing_author)
+    await callback.answer()
+
+@router.callback_query(AIFindStates.choosing_author, F.data == "aiauth_new")
+async def aifind_new_author(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("أرسل اسم المؤلف الجديد:")
+    await state.set_state(AIFindStates.waiting_for_new_author)
+    await callback.answer()
+
+@router.message(AIFindStates.waiting_for_new_author)
+async def process_new_author(message: Message, state: FSMContext):
+    name = message.text.strip()
+    with get_db_context() as db:
+        author = await AuthorService(db).create(name=name)
+        await state.update_data(author_id=author.id)
+    data = await state.get_data()
+    with get_db_context() as db:
+        book = Book(
+            title=data.get('book_title', 'عنوان AI'),
+            author=author.name,
+            description=data.get('book_desc', ''),
+            category_id=data.get('cat_id'),
+            file_path=None,
+            status=BookStatus.PENDING
+        )
+        db.add(book)
+        db.commit()
+        await message.answer(f"✅ تمت إضافة الكتاب '{book.title}' تحت القسم المختار والمؤلف '{author.name}'.")
+    await state.clear()
+
+@router.callback_query(AIFindStates.choosing_author, F.data.startswith("aiauth_"))
+async def aifind_existing_author(callback: CallbackQuery, state: FSMContext):
+    author_id = int(callback.data.replace("aiauth_", ""))
+    await state.update_data(author_id=author_id)
+    with get_db_context() as db:
+        author = db.query(Author).get(author_id)
+        if not author:
+            await callback.message.answer("المؤلف غير موجود.")
+            await state.clear()
+            return
+        data = await state.get_data()
+        book = Book(
+            title=data.get('book_title', 'عنوان AI'),
+            author=author.name,
+            description=data.get('book_desc', ''),
+            category_id=data.get('cat_id'),
+            file_path=None,
+            status=BookStatus.PENDING
+        )
+        db.add(book)
+        db.commit()
+        await callback.message.answer(f"✅ تمت إضافة الكتاب '{book.title}' تحت القسم المختار والمؤلف '{author.name}'.")
+    await state.clear()
+
+@router.callback_query(F.data == "aifind_cancel")
+async def aifind_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("تم إلغاء العملية.")
+    await state.clear()
+    await callback.answer()
+async def send_new_book_notifications(book: Book, db):
+    """إرسال إشعار للمستخدمين الذين يفضلون هذا القسم"""
+    try:
+        if not book.category_id:
+            return
+        users = db.query(User).filter(
+            User.notification_setting.has(receive_on_new_book=True)
+        ).all()
+        for user in users:
+            try:
+                # يمكنك تخصيص الإشعار حسب تفضيلات المستخدم
+                await bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"📚 تمت إضافة كتاب جديد في قسم '{book.category.name_ar or book.category.name}':\n{book.title} - {book.author}"
+                )
+            except:
+                pass
+    except Exception as e:
+        logger.error(f"Error sending notifications: {e}")
+
+async def auto_post_to_channel(book: Book, bot):
+    """نشر تلقائي في القناة المرتبطة"""
+    try:
+        with get_db_context() as db:
+            channel_setting = db.query(ChannelSetting).filter(ChannelSetting.auto_post == True).first()
+            if not channel_setting:
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 تحميل", callback_data=f"download_{book.id}")]
+            ])
+            await bot.send_message(
+                chat_id=channel_setting.channel_id,
+                text=f"📚 كتاب جديد:\n{book.title} - {book.author}\n{book.description[:200]}",
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logger.error(f"Error auto posting: {e}")
+# ---------- لوحة تحكم المالك التفاعلية (مُحدّثة) ----------
+
+@router.message(Command("admin"))
+async def cmd_admin_panel(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ هذا الأمر مخصص للمالك فقط.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 إحصائيات متقدمة", callback_data="owner_stats")],
+        [InlineKeyboardButton(text="📚 كتب قيد المراجعة", callback_data="owner_pending")],
+        [InlineKeyboardButton(text="📡 قنوات الإجبار", callback_data="owner_channels")],
+        [InlineKeyboardButton(text="📁 إدارة الأقسام", callback_data="owner_categories")],
+        [InlineKeyboardButton(text="✍️ إدارة المؤلفين", callback_data="owner_authors")],
+        [InlineKeyboardButton(text="👥 إدارة المستخدمين", callback_data="owner_users")],
+        [InlineKeyboardButton(text="🤖 بحث ذكي / AI", callback_data="owner_aifind")],
+        [InlineKeyboardButton(text="📤 رفع كتاب", callback_data="owner_upload")],
+        [InlineKeyboardButton(text="📤 تصدير CSV", callback_data="owner_exportcsv")],
+        [InlineKeyboardButton(text="📡 إعداد قناة النشر", callback_data="owner_setchannel")],
+        [InlineKeyboardButton(text="🔙 إغلاق", callback_data="owner_close")]
+    ])
+    await message.answer("👑 **لوحة تحكم المالك**", reply_markup=keyboard)
+
+# معالجات الأزرار الجديدة
+@router.callback_query(F.data == "owner_exportcsv")
+async def owner_exportcsv(callback: CallbackQuery):
+    await cmd_export_csv(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_setchannel")
+async def owner_setchannel(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل معرف القناة للنشر التلقائي (مع @):")
+    await state.set_state("waiting_for_channel_set")
+    await callback.answer()
+@router.callback_query(F.data == "owner_upload")
+async def owner_upload_button(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("📎 أرسل ملف الكتاب (PDF/EPUB/TXT):")
+    await state.set_state(UploadStates.waiting_for_file)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_stats")
+async def owner_stats(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    with get_db_context() as db:
+        service = AdminService(db)
+        stats = await service.get_statistics()
+        text = (
+            "📊 **إحصائيات النظام**\n\n"
+            f"👥 المستخدمين: {stats.get('total_users', 0)}\n"
+            f"🟢 نشط: {stats.get('active_users', 0)}\n"
+            f"📚 الكتب: {stats.get('total_books', 0)}\n"
+            f"📗 نشطة: {stats.get('active_books', 0)}\n"
+            f"⏳ قيد المراجعة: {stats.get('pending_books', 0)}"
+        )
+    await callback.message.answer(text)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_pending")
+async def owner_pending(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    with get_db_context() as db:
+        service = AdminService(db)
+        books = await service.get_pending_books(10)
+        if books:
+            text = "📚 **كتب قيد المراجعة**\n\n"
+            for b in books:
+                text += f"• {b.title} (ID: {b.id})\n"
+        else:
+            text = "لا توجد كتب قيد المراجعة."
+    await callback.message.answer(text)
+    await callback.answer()
+    
+@router.message(Command("setchannel"))
+async def cmd_set_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل معرف القناة للنشر التلقائي (مع @):")
+    await state.set_state("waiting_for_channel_set")
+
+@router.message(StateFilter("waiting_for_channel_set"))
+async def process_set_channel(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    if not channel_id.startswith("@"):
+        await message.answer("يجب أن يبدأ بـ @")
+        return
+    with get_db_context() as db:
+        existing = db.query(ChannelSetting).first()
+        if existing:
+            existing.channel_id = channel_id
+        else:
+            db.add(ChannelSetting(channel_id=channel_id))
+        db.commit()
+    await message.answer(f"✅ تم تعيين القناة {channel_id} للنشر التلقائي")
+    await state.clear()
+
+@router.message(Command("channelstats"))
+async def cmd_channel_stats(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        channel_setting = db.query(ChannelSetting).first()
+        if not channel_setting:
+            return await message.answer("لم يتم تعيين قناة بعد. استخدم /setchannel")
+        try:
+            chat = await message.bot.get_chat(channel_setting.channel_id)
+            count = await message.bot.get_chat_member_count(channel_setting.channel_id)
+            await message.answer(f"📡 **إحصائيات القناة**\n\nالقناة: {chat.title}\nعدد المشتركين: {count}")
+        except Exception as e:
+            await message.answer(f"تعذر الحصول على الإحصائيات: {str(e)}")
+@router.callback_query(F.data == "owner_close")
+async def owner_close(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
+# ---------- الإحصائيات المتقدمة ----------
+@router.message(Command("stats"))
+async def cmd_stats_advanced(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        # إحصائيات أساسية
+        total_users = db.query(User).count()
+        active_users = db.query(User).filter(User.status == UserStatus.ACTIVE).count()
+        total_books = db.query(Book).count()
+        active_books = db.query(Book).filter(Book.status == BookStatus.ACTIVE).count()
+        pending_books = db.query(Book).filter(Book.status == BookStatus.PENDING).count()
+
+        # أكثر 10 كتب تحميلاً
+        top_books = db.query(Book).filter(Book.status == BookStatus.ACTIVE).order_by(Book.download_count.desc()).limit(10).all()
+        top_books_text = "\n".join([f"{i+1}. {b.title} - {b.author} ({b.download_count} تحميل)" for i,b in enumerate(top_books)])
+
+        # أكثر المستخدمين نشاطاً
+        top_users = db.query(User).filter(User.status == UserStatus.ACTIVE).order_by(User.total_downloads.desc()).limit(10).all()
+        top_users_text = "\n".join([f"{i+1}. {u.get_full_name()} (@{u.username or 'لا يوجد'}) - {u.total_downloads} تحميل" for i,u in enumerate(top_users)])
+
+        # توزيع الكتب حسب الأقسام
+        categories = db.query(BookCategory).all()
+        cat_text = ""
+        for cat in categories:
+            count = db.query(Book).filter(Book.category_id == cat.id).count()
+            cat_text += f"• {cat.name_ar or cat.name}: {count} كتب\n"
+
+        text = (
+            f"📊 **إحصائيات النظام**\n\n"
+            f"👥 المستخدمين: {total_users} (نشط: {active_users})\n"
+            f"📚 الكتب: {total_books} (نشطة: {active_books}, معلقة: {pending_books})\n\n"
+            f"📈 **أكثر الكتب تحميلاً**\n{top_books_text}\n\n"
+            f"🏅 **أكثر المستخدمين نشاطاً**\n{top_users_text}\n\n"
+            f"📁 **توزيع الكتب حسب الأقسام**\n{cat_text}"
+        )
+        await message.answer(text)
+@router.message(Command("exportcsv"))
+async def cmd_export_csv(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("اختر نوع التقرير:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="الكتب", callback_data="csv_books")],
+        [InlineKeyboardButton(text="المستخدمين", callback_data="csv_users")],
+        [InlineKeyboardButton(text="التحميلات", callback_data="csv_downloads")]
+    ]))
+
+@router.callback_query(F.data.startswith("csv_"))
+async def export_csv_handler(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    export_type = callback.data.replace("csv_", "")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    with get_db_context() as db:
+        if export_type == "books":
+            writer.writerow(["ID", "Title", "Author", "Downloads", "Status"])
+            books = db.query(Book).all()
+            for b in books:
+                writer.writerow([b.id, b.title, b.author, b.download_count, b.status.value])
+        elif export_type == "users":
+            writer.writerow(["ID", "Telegram ID", "Name", "Username", "Downloads", "Status"])
+            users = db.query(User).all()
+            for u in users:
+                writer.writerow([u.id, u.telegram_id, u.get_full_name(), u.username, u.total_downloads, u.status.value])
+        elif export_type == "downloads":
+            writer.writerow(["ID", "User ID", "Book ID", "Downloaded At"])
+            histories = db.query(DownloadHistory).all()
+            for h in histories:
+                writer.writerow([h.id, h.user_id, h.book_id, h.downloaded_at])
+    
+    output.seek(0)
+    await callback.message.answer_document(
+        document=aiogram.types.BufferedInputFile(output.getvalue().encode(), filename=f"{export_type}_report.csv"),
+        caption=f"تقرير {export_type}"
+    )
+    await callback.answer()
