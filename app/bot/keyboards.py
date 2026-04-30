@@ -1,6 +1,8 @@
-"""Telegram Keyboards Module"""
+"""Telegram Keyboards Module (Dynamic Categories)"""
 
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from app.database import SessionLocal
+from app.models.book import BookCategory
 
 
 def get_main_keyboard():
@@ -17,19 +19,21 @@ def get_main_keyboard():
     return keyboard
 
 
-def get_category_keyboard():
-    """Get category selection keyboard"""
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="البرمجة", callback_data="cat_programming")],
-            [InlineKeyboardButton(text="التنمية الذاتية", callback_data="cat_self_dev")],
-            [InlineKeyboardButton(text="الرومانسية", callback_data="cat_romance")],
-            [InlineKeyboardButton(text="الخيال العلمي", callback_data="cat_scifi")],
-            [InlineKeyboardButton(text="التاريخ", callback_data="cat_history")],
-            [InlineKeyboardButton(text="العودة", callback_data="back")],
-        ]
-    )
-    return keyboard
+async def get_category_keyboard():
+    """Get dynamic category selection keyboard from database"""
+    db = SessionLocal()
+    try:
+        categories = db.query(BookCategory).filter(BookCategory.is_active == True).all()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+        for cat in categories:
+            label = cat.name_ar or cat.name
+            keyboard.inline_keyboard.append(
+                [InlineKeyboardButton(text=label, callback_data=f"cat_{cat.id}")]
+            )
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="العودة", callback_data="back")])
+        return keyboard
+    finally:
+        db.close()
 
 
 def get_book_keyboard(book_id: int):
@@ -89,6 +93,8 @@ def get_language_keyboard():
         ]
     )
     return keyboard
+
+
 def get_commands_inline_keyboard():
     """لوحة الأوامر الرئيسية كأزرار Inline"""
     keyboard = InlineKeyboardMarkup(
