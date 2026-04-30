@@ -1,10 +1,11 @@
 """
 New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix,
 Force Join Channels, Owner Interactive Panel, Categories & Authors Management,
-User Management, AI-Powered Book Finder & Adder (Fully Fixed)
+User Management, AI-Powered Book Finder & Adder, Upload, Favorites, History, Ratings
 """
 
 import logging
+import os
 from aiogram import Router, F, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
@@ -31,6 +32,8 @@ from app.services.ai_service import AIService
 from app.models.book import Book, BookCategory, BookStatus
 from app.models.author import Author
 from app.models.user import User, UserStatus
+from app.models.favorite import Favorite
+from app.models.download_history import DownloadHistory
 from app.admin.admin_service import AdminService
 
 logger = logging.getLogger(__name__)
@@ -49,7 +52,6 @@ class CategoryStates(StatesGroup):
     waiting_for_category_name = State()
     waiting_for_category_name_ar = State()
     waiting_for_category_id = State()
-    # تعديل قسم
     waiting_for_edit_category_id = State()
     waiting_for_edit_category_field = State()
     waiting_for_edit_category_value = State()
@@ -58,7 +60,6 @@ class AuthorStates(StatesGroup):
     waiting_for_author_name = State()
     waiting_for_author_bio = State()
     waiting_for_author_id = State()
-    # تعديل مؤلف
     waiting_for_edit_author_id = State()
     waiting_for_edit_author_field = State()
     waiting_for_edit_author_value = State()
@@ -76,6 +77,13 @@ class AIFindStates(StatesGroup):
     choosing_category = State()
     choosing_author = State()
     waiting_for_new_author = State()
+
+class UploadStates(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_title = State()
+    waiting_for_author = State()
+    waiting_for_category = State()
+    waiting_for_description = State()
 
 # ---------- دوال مساعدة ----------
 def is_owner(telegram_id: int) -> bool:
@@ -387,7 +395,9 @@ async def inline_help(callback: CallbackQuery):
         "🔥 الكتب الرائجة - الأكثر تحميلاً\n"
         "⭐ الكتب المميزة - المختارة يدوياً\n"
         "🔍 بحث - ابحث عن أي كتاب\n"
-        "📚 تصفح الكتب - تصفح الأقسام"
+        "📚 تصفح الكتب - تصفح الأقسام\n"
+        "/favorites - المفضلة\n"
+        "/history - سجل التحميلات"
     )
     await callback.message.answer(help_text)
     await callback.answer()
@@ -396,6 +406,139 @@ async def inline_help(callback: CallbackQuery):
 @router.message(F.text == "📋 الأوامر")
 async def show_commands(message: Message):
     await message.answer("اختر الأمر الذي تريد:", reply_markup=get_commands_inline_keyboard())
+
+# ---------- رفع الكتب (/upload) ----------
+@router.message(Command("upload"))
+async def cmd_upload(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📎 أرسل ملف الكتاب (PDF/EPUB/TXT):")
+    await state.set_state(UploadStates.waiting_for_file)
+
+@router.message(UploadStates.waiting_for_file, F.document)
+async def process_upload_file(message: Message, state: FSMContext):
+    document = message.document
+    file_name = document.file_name
+    allowed_exts = settings.allowed_file_types.split(",")
+    ext = file_name.rsplit(".", 1)[-1].lower()
+    if ext not in allowed_exts:
+        await message.answer(f"❌ الملف غير مسموح. الأنواع المسموحة: {settings.allowed_file_types}")
+        return
+    os.makedirs("uploads", exist_ok=True)
+    file_path = f"uploads/{file_name}"
+    await message.bot.download(file=document, destination=file_path)
+    await state.update_data(file_path=file_path)
+    await message.answer("📝 أرسل عنوان الكتاب:")
+    await state.set_state(UploadStates.waiting_for_title)
+
+@router.message(UploadStates.waiting_for_title)
+async def process_upload_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await message.answer("✍️ أرسل اسم المؤلف:")
+    await state.set_state(UploadStates.waiting_for_author)
+
+@router.message(UploadStates.waiting_for_author)
+async def process_upload_author(message: Message, state: FSMContext):
+    await state.update_data(author=message.text.strip())
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            await state.update_data(category_id=None)
+            await message.answer("📄 أرسل وصف الكتاب (أو /skip):")
+            await state.set_state(UploadStates.waiting_for_description)
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=c.name, callback_data=f"upcat_{c.id}")] for c in cats
+            ])
+            await message.answer("📁 اختر القسم:", reply_markup=keyboard)
+            await state.set_state(UploadStates.waiting_for_category)
+
+@router.callback_query(UploadStates.waiting_for_category, F.data.startswith("upcat_"))
+async def process_upload_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.replace("upcat_", ""))
+    await state.update_data(category_id=cat_id)
+    await callback.message.answer("📄 أرسل وصف الكتاب (أو /skip):")
+    await state.set_state(UploadStates.waiting_for_description)
+    await callback.answer()
+
+@router.message(UploadStates.waiting_for_description)
+async def process_upload_description(message: Message, state: FSMContext):
+    desc = message.text.strip() if message.text != "/skip" else ""
+    data = await state.get_data()
+    with get_db_context() as db:
+        book = Book(
+            title=data['title'],
+            author=data['author'],
+            description=desc,
+            category_id=data.get('category_id'),
+            file_path=data['file_path'],
+            status=BookStatus.PENDING
+        )
+        db.add(book)
+        db.commit()
+        await message.answer(f"✅ تم رفع الكتاب '{book.title}' وهو قيد المراجعة.")
+    await state.clear()
+
+# ---------- المفضلة والسجل ----------
+@router.message(Command("favorites"))
+async def cmd_favorites(message: Message):
+    user_id = message.from_user.id
+    with get_db_context() as db:
+        favs = db.query(Favorite).filter_by(user_id=user_id).all()
+        if not favs:
+            return await message.answer("لم تضف أي كتب إلى المفضلة.")
+        text = "❤️ **المفضلة**\n\n"
+        for f in favs:
+            text += f"• {f.book.title} - {f.book.author}\n"
+        await message.answer(text)
+
+@router.message(Command("history"))
+async def cmd_history(message: Message):
+    user_id = message.from_user.id
+    with get_db_context() as db:
+        hist = db.query(DownloadHistory).filter_by(user_id=user_id).order_by(DownloadHistory.downloaded_at.desc()).limit(10).all()
+        if not hist:
+            return await message.answer("لا يوجد سجل تحميلات.")
+        text = "📥 **آخر التحميلات**\n\n"
+        for h in hist:
+            text += f"• {h.book.title} - {h.downloaded_at.strftime('%Y-%m-%d')}\n"
+        await message.answer(text)
+
+@router.callback_query(F.data.startswith("fav_"))
+async def toggle_favorite(callback: CallbackQuery):
+    book_id = int(callback.data.replace("fav_", ""))
+    user_id = callback.from_user.id
+    with get_db_context() as db:
+        exists = db.query(Favorite).filter_by(user_id=user_id, book_id=book_id).first()
+        if exists:
+            db.delete(exists)
+            await callback.answer("تمت إزالة الكتاب من المفضلة", show_alert=True)
+        else:
+            db.add(Favorite(user_id=user_id, book_id=book_id))
+            await callback.answer("تمت إضافة الكتاب إلى المفضلة", show_alert=True)
+        db.commit()
+
+# ---------- التقييمات ----------
+@router.callback_query(F.data.startswith("rate_"))
+async def handle_rate_book(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer("بيانات غير صحيحة")
+        return
+    try:
+        rating = int(parts[1])
+        book_id = int(parts[2])
+    except ValueError:
+        await callback.answer("خطأ في البيانات")
+        return
+    if not 1 <= rating <= 5:
+        await callback.answer("تقييم غير صالح")
+        return
+    user_id = callback.from_user.id
+    with get_db_context() as db:
+        book_service = BookService(db)
+        await book_service.add_rating(book_id, user_id, rating)
+        await callback.answer("تم تسجيل تقييمك، شكراً!", show_alert=True)
 
 # ---------- دوال العرض التفاعلي للوحات الإدارة ----------
 async def show_categories_panel(message: Message, user_id: int):
@@ -1116,9 +1259,19 @@ async def cmd_admin_panel(message: Message):
         [InlineKeyboardButton(text="✍️ إدارة المؤلفين", callback_data="owner_authors")],
         [InlineKeyboardButton(text="👥 إدارة المستخدمين", callback_data="owner_users")],
         [InlineKeyboardButton(text="🤖 بحث ذكي / AI", callback_data="owner_aifind")],
+        [InlineKeyboardButton(text="📤 رفع كتاب", callback_data="owner_upload")],
         [InlineKeyboardButton(text="🔙 إغلاق", callback_data="owner_close")]
     ])
     await message.answer("👑 **لوحة تحكم المالك**", reply_markup=keyboard)
+
+@router.callback_query(F.data == "owner_upload")
+async def owner_upload_button(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("📎 أرسل ملف الكتاب (PDF/EPUB/TXT):")
+    await state.set_state(UploadStates.waiting_for_file)
+    await callback.answer()
 
 @router.callback_query(F.data == "owner_stats")
 async def owner_stats(callback: CallbackQuery):
