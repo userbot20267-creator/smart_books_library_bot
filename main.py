@@ -38,10 +38,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database: {str(e)}")
     
     # تشغيل بوت تيليجرام (aiogram)
-    if settings.TELEGRAM_BOT_TOKEN:
+    if settings.telegram_bot_token:  # صحيح: telegram_bot_token
         try:
             # إعداد البوت والـ dispatcher
-            bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+            bot = Bot(token=settings.telegram_bot_token)  # صحيح
             dp = Dispatcher(storage=MemoryStorage())
             dp.include_router(handlers_router)  # تضمين الراوتر من البوت
 
@@ -139,4 +139,4 @@ if __name__ == "__main__":
         port=settings.fastapi_port,
         reload=settings.fastapi_reload,
         log_level=settings.log_level.lower()
-    )
+            )
