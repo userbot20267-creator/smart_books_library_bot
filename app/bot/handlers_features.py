@@ -16,6 +16,12 @@ from app.services.points_service import PointsService
 from app.services.book_service import BookService
 from app.services.search_service import SearchService
 from app.models.book import Book, BookCategory, BookStatus
+from app.bot.keyboards import (
+    get_main_keyboard,
+    get_category_keyboard,
+    get_settings_keyboard,
+    get_commands_inline_keyboard  # ← أضف هذا
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -232,3 +238,72 @@ async def button_profile(message: Message):
 @router.message(F.text == "🎁 نقاطي")
 async def button_points(message: Message):
     await show_points_logic(message)
+# ---------- أزرار الأوامر التفاعلية (Inline) ----------
+
+@router.callback_query(F.data == "cmd_profile")
+async def inline_profile(callback: CallbackQuery):
+    await show_profile_logic(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_points")
+async def inline_points(callback: CallbackQuery):
+    await show_points_logic(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_trending")
+async def inline_trending(callback: CallbackQuery):
+    with get_db_context() as db:
+        book_service = BookService(db)
+        books = await book_service.get_trending_books(5)
+        if books:
+            text = "🔥 **الكتب الرائجة**\n\n"
+            for i, book in enumerate(books, 1):
+                text += f"{i}. {book.title} - {book.author}\n"
+            await callback.message.answer(text)
+        else:
+            await callback.message.answer("لا توجد كتب رائجة حالياً.")
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_featured")
+async def inline_featured(callback: CallbackQuery):
+    with get_db_context() as db:
+        book_service = BookService(db)
+        books = await book_service.get_featured_books(5)
+        if books:
+            text = "⭐ **الكتب المميزة**\n\n"
+            for i, book in enumerate(books, 1):
+                text += f"{i}. {book.title} - {book.author}\n"
+            await callback.message.answer(text)
+        else:
+            await callback.message.answer("لا توجد كتب مميزة حالياً.")
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_search")
+async def inline_search(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
+    await state.set_state(SearchStates.waiting_for_query)
+    await callback.answer()
+
+@router.callback_query(F.data == "cmd_help")
+async def inline_help(callback: CallbackQuery):
+    help_text = (
+        "📚 **مساعدة - مكتبة الكتب الذكية**\n\n"
+        "الأوامر المتاحة:\n"
+        "/start - بدء التطبيق\n"
+        "/help - عرض المساعدة\n"
+        "👤 ملفي الشخصي - معلوماتك\n"
+        "🎁 نقاطي - مجموع نقاطك\n"
+        "🔥 الكتب الرائجة - الأكثر تحميلاً\n"
+        "⭐ الكتب المميزة - المختارة يدوياً\n"
+        "🔍 بحث - ابحث عن أي كتاب\n"
+        "📚 تصفح الكتب - تصفح الأقسام"
+    )
+    await callback.message.answer(help_text)
+    await callback.answer()
+
+# ---------- زر لعرض لوحة الأوامر التفاعلية (اختياري) ----------
+# يمكنك إضافة زر "📋 الأوامر" في لوحة المفاتيح الرئيسية، أو إرسال أمر /commands
+@router.message(Command("commands"))
+@router.message(F.text == "📋 الأوامر")
+async def show_commands(message: Message):
+    await message.answer("اختر الأمر الذي تريد:", reply_markup=get_commands_inline_keyboard())
