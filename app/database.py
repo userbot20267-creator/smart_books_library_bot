@@ -11,11 +11,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Create database engine
+# نسخ الإعدادات لتفادي تعديل الأصل
+db_settings = settings.database_settings.copy()
+# استخراج الرابط من القاموس إن وُجد، وإلا استخدم الإعدادات المباشرة
+database_url = db_settings.pop('url', settings.database_url)
+
+# إنشاء محرك قاعدة البيانات بدون تضارب في url
 engine = create_engine(
-    settings.database_url,
-    **settings.database_settings,
-    connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {}
+    database_url,
+    **db_settings,
+    connect_args={"check_same_thread": False} if "sqlite" in database_url else {}
 )
 
 # Create session factory
