@@ -8,7 +8,7 @@ from .coupon import Coupon, UserCoupon
 from .referral import Referral
 from .pack import Pack, PackBook
 from .admin import AdminUser, AdminLog
-
+from .force_join import ForceJoinChannel
 __all__ = [
     "User",
     "Book",
@@ -24,4 +24,10 @@ __all__ = [
     "PackBook",
     "AdminUser",
     "AdminLog",
+
+
+# أضفها إلى قائمة __all__
+__all__ = [
+    # ... الموجودين
+    "ForceJoinChannel",
 ]
