@@ -3,9 +3,13 @@ New Features Handlers – Search, Profile, Points, Trending, Featured, Categorie
 Force Join Channels, Owner Interactive Panel, Categories & Authors Management,
 User Management, AI-Powered Book Finder & Adder, Upload, Favorites, History, Ratings
 """
-
+import csv
+import io
 import logging
 import os
+from datetime import datetime
+from app.models.notification import NotificationSetting
+from app.models.channel_setting import ChannelSetting
 from aiogram import Router, F, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
@@ -1245,14 +1249,51 @@ async def aifind_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("تم إلغاء العملية.")
     await state.clear()
     await callback.answer()
+async def send_new_book_notifications(book: Book, db):
+    """إرسال إشعار للمستخدمين الذين يفضلون هذا القسم"""
+    try:
+        if not book.category_id:
+            return
+        users = db.query(User).filter(
+            User.notification_setting.has(receive_on_new_book=True)
+        ).all()
+        for user in users:
+            try:
+                # يمكنك تخصيص الإشعار حسب تفضيلات المستخدم
+                await bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"📚 تمت إضافة كتاب جديد في قسم '{book.category.name_ar or book.category.name}':\n{book.title} - {book.author}"
+                )
+            except:
+                pass
+    except Exception as e:
+        logger.error(f"Error sending notifications: {e}")
 
+async def auto_post_to_channel(book: Book, bot):
+    """نشر تلقائي في القناة المرتبطة"""
+    try:
+        with get_db_context() as db:
+            channel_setting = db.query(ChannelSetting).filter(ChannelSetting.auto_post == True).first()
+            if not channel_setting:
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 تحميل", callback_data=f"download_{book.id}")]
+            ])
+            await bot.send_message(
+                chat_id=channel_setting.channel_id,
+                text=f"📚 كتاب جديد:\n{book.title} - {book.author}\n{book.description[:200]}",
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logger.error(f"Error auto posting: {e}")
 # ---------- لوحة تحكم المالك التفاعلية (مُحدّثة) ----------
+
 @router.message(Command("admin"))
 async def cmd_admin_panel(message: Message):
     if not is_owner(message.from_user.id):
         return await message.answer("❌ هذا الأمر مخصص للمالك فقط.")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 إحصائيات", callback_data="owner_stats")],
+        [InlineKeyboardButton(text="📊 إحصائيات متقدمة", callback_data="owner_stats")],
         [InlineKeyboardButton(text="📚 كتب قيد المراجعة", callback_data="owner_pending")],
         [InlineKeyboardButton(text="📡 قنوات الإجبار", callback_data="owner_channels")],
         [InlineKeyboardButton(text="📁 إدارة الأقسام", callback_data="owner_categories")],
@@ -1260,10 +1301,26 @@ async def cmd_admin_panel(message: Message):
         [InlineKeyboardButton(text="👥 إدارة المستخدمين", callback_data="owner_users")],
         [InlineKeyboardButton(text="🤖 بحث ذكي / AI", callback_data="owner_aifind")],
         [InlineKeyboardButton(text="📤 رفع كتاب", callback_data="owner_upload")],
+        [InlineKeyboardButton(text="📤 تصدير CSV", callback_data="owner_exportcsv")],
+        [InlineKeyboardButton(text="📡 إعداد قناة النشر", callback_data="owner_setchannel")],
         [InlineKeyboardButton(text="🔙 إغلاق", callback_data="owner_close")]
     ])
     await message.answer("👑 **لوحة تحكم المالك**", reply_markup=keyboard)
 
+# معالجات الأزرار الجديدة
+@router.callback_query(F.data == "owner_exportcsv")
+async def owner_exportcsv(callback: CallbackQuery):
+    await cmd_export_csv(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_setchannel")
+async def owner_setchannel(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("أرسل معرف القناة للنشر التلقائي (مع @):")
+    await state.set_state("waiting_for_channel_set")
+    await callback.answer()
 @router.callback_query(F.data == "owner_upload")
 async def owner_upload_button(callback: CallbackQuery, state: FSMContext):
     if not is_owner(callback.from_user.id):
@@ -1308,8 +1365,124 @@ async def owner_pending(callback: CallbackQuery):
             text = "لا توجد كتب قيد المراجعة."
     await callback.message.answer(text)
     await callback.answer()
+    
+@router.message(Command("setchannel"))
+async def cmd_set_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("أرسل معرف القناة للنشر التلقائي (مع @):")
+    await state.set_state("waiting_for_channel_set")
 
+@router.message(StateFilter("waiting_for_channel_set"))
+async def process_set_channel(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    if not channel_id.startswith("@"):
+        await message.answer("يجب أن يبدأ بـ @")
+        return
+    with get_db_context() as db:
+        existing = db.query(ChannelSetting).first()
+        if existing:
+            existing.channel_id = channel_id
+        else:
+            db.add(ChannelSetting(channel_id=channel_id))
+        db.commit()
+    await message.answer(f"✅ تم تعيين القناة {channel_id} للنشر التلقائي")
+    await state.clear()
+
+@router.message(Command("channelstats"))
+async def cmd_channel_stats(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        channel_setting = db.query(ChannelSetting).first()
+        if not channel_setting:
+            return await message.answer("لم يتم تعيين قناة بعد. استخدم /setchannel")
+        try:
+            chat = await message.bot.get_chat(channel_setting.channel_id)
+            count = await message.bot.get_chat_member_count(channel_setting.channel_id)
+            await message.answer(f"📡 **إحصائيات القناة**\n\nالقناة: {chat.title}\nعدد المشتركين: {count}")
+        except Exception as e:
+            await message.answer(f"تعذر الحصول على الإحصائيات: {str(e)}")
 @router.callback_query(F.data == "owner_close")
 async def owner_close(callback: CallbackQuery):
     await callback.message.delete()
+    await callback.answer()
+# ---------- الإحصائيات المتقدمة ----------
+@router.message(Command("stats"))
+async def cmd_stats_advanced(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        # إحصائيات أساسية
+        total_users = db.query(User).count()
+        active_users = db.query(User).filter(User.status == UserStatus.ACTIVE).count()
+        total_books = db.query(Book).count()
+        active_books = db.query(Book).filter(Book.status == BookStatus.ACTIVE).count()
+        pending_books = db.query(Book).filter(Book.status == BookStatus.PENDING).count()
+
+        # أكثر 10 كتب تحميلاً
+        top_books = db.query(Book).filter(Book.status == BookStatus.ACTIVE).order_by(Book.download_count.desc()).limit(10).all()
+        top_books_text = "\n".join([f"{i+1}. {b.title} - {b.author} ({b.download_count} تحميل)" for i,b in enumerate(top_books)])
+
+        # أكثر المستخدمين نشاطاً
+        top_users = db.query(User).filter(User.status == UserStatus.ACTIVE).order_by(User.total_downloads.desc()).limit(10).all()
+        top_users_text = "\n".join([f"{i+1}. {u.get_full_name()} (@{u.username or 'لا يوجد'}) - {u.total_downloads} تحميل" for i,u in enumerate(top_users)])
+
+        # توزيع الكتب حسب الأقسام
+        categories = db.query(BookCategory).all()
+        cat_text = ""
+        for cat in categories:
+            count = db.query(Book).filter(Book.category_id == cat.id).count()
+            cat_text += f"• {cat.name_ar or cat.name}: {count} كتب\n"
+
+        text = (
+            f"📊 **إحصائيات النظام**\n\n"
+            f"👥 المستخدمين: {total_users} (نشط: {active_users})\n"
+            f"📚 الكتب: {total_books} (نشطة: {active_books}, معلقة: {pending_books})\n\n"
+            f"📈 **أكثر الكتب تحميلاً**\n{top_books_text}\n\n"
+            f"🏅 **أكثر المستخدمين نشاطاً**\n{top_users_text}\n\n"
+            f"📁 **توزيع الكتب حسب الأقسام**\n{cat_text}"
+        )
+        await message.answer(text)
+@router.message(Command("exportcsv"))
+async def cmd_export_csv(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("اختر نوع التقرير:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="الكتب", callback_data="csv_books")],
+        [InlineKeyboardButton(text="المستخدمين", callback_data="csv_users")],
+        [InlineKeyboardButton(text="التحميلات", callback_data="csv_downloads")]
+    ]))
+
+@router.callback_query(F.data.startswith("csv_"))
+async def export_csv_handler(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    export_type = callback.data.replace("csv_", "")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    with get_db_context() as db:
+        if export_type == "books":
+            writer.writerow(["ID", "Title", "Author", "Downloads", "Status"])
+            books = db.query(Book).all()
+            for b in books:
+                writer.writerow([b.id, b.title, b.author, b.download_count, b.status.value])
+        elif export_type == "users":
+            writer.writerow(["ID", "Telegram ID", "Name", "Username", "Downloads", "Status"])
+            users = db.query(User).all()
+            for u in users:
+                writer.writerow([u.id, u.telegram_id, u.get_full_name(), u.username, u.total_downloads, u.status.value])
+        elif export_type == "downloads":
+            writer.writerow(["ID", "User ID", "Book ID", "Downloaded At"])
+            histories = db.query(DownloadHistory).all()
+            for h in histories:
+                writer.writerow([h.id, h.user_id, h.book_id, h.downloaded_at])
+    
+    output.seek(0)
+    await callback.message.answer_document(
+        document=aiogram.types.BufferedInputFile(output.getvalue().encode(), filename=f"{export_type}_report.csv"),
+        caption=f"تقرير {export_type}"
+    )
     await callback.answer()
