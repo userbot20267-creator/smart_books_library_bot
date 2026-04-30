@@ -1,30 +1,31 @@
 """
-New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix
+New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix,
+Force Join Channels, Owner Interactive Panel
 """
 
 import logging
-from aiogram import Router, F
+from aiogram import Router, F, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from typing import Any, Awaitable, Callable, Dict
+
 from config.settings import settings
-from app.bot.keyboards import get_main_keyboard, get_category_keyboard, get_settings_keyboard
-from app.database import get_db_context
-from app.services.user_service import UserService
-from app.services.points_service import PointsService
-from app.services.book_service import BookService
-from app.services.channel_service import ChannelService
-from app.models.force_join import ForceJoinChannel
-from aiogram.filters import Command
-from app.services.search_service import SearchService
-from app.models.book import Book, BookCategory, BookStatus
 from app.bot.keyboards import (
     get_main_keyboard,
     get_category_keyboard,
     get_settings_keyboard,
-    get_commands_inline_keyboard  # ← أضف هذا
+    get_commands_inline_keyboard
 )
+from app.database import get_db_context
+from app.services.user_service import UserService
+from app.services.points_service import PointsService
+from app.services.book_service import BookService
+from app.services.search_service import SearchService
+from app.services.channel_service import ChannelService
+from app.models.book import Book, BookCategory, BookStatus
+from app.admin.admin_service import AdminService
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -34,10 +35,15 @@ class SearchStates(StatesGroup):
     waiting_for_query = State()
     choosing_search_type = State()
 
+class ChannelStates(StatesGroup):
+    waiting_for_channel_id = State()
+    waiting_for_channel_remove = State()
+
 # ---------- دوال مساعدة ----------
+def is_owner(telegram_id: int) -> bool:
+    return telegram_id == settings.telegram_admin_id
 
 async def show_profile_logic(message: Message):
-    """المنطق المشترك لعرض الملف الشخصي"""
     try:
         user = message.from_user
         with get_db_context() as db:
@@ -60,7 +66,6 @@ async def show_profile_logic(message: Message):
         await message.answer("حدث خطأ. يرجى المحاولة لاحقاً.")
 
 async def show_points_logic(message: Message):
-    """المنطق المشترك لعرض النقاط"""
     try:
         user = message.from_user
         with get_db_context() as db:
@@ -85,8 +90,42 @@ async def show_points_logic(message: Message):
         logger.error(f"Error showing points: {str(e)}")
         await message.answer("حدث خطأ. يرجى المحاولة لاحقاً.")
 
-# ---------- الأوامر المفقودة ----------
+# ---------- Middleware الاشتراك الإجباري ----------
+class ForceJoinMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: Dict[str, Any]
+    ) -> Any:
+        if not event.from_user:
+            return await handler(event, data)
 
+        # تخطي الفحص للمالك
+        if is_owner(event.from_user.id):
+            return await handler(event, data)
+
+        # تخطي أمر /start
+        if event.text and event.text.startswith('/start'):
+            return await handler(event, data)
+
+        bot = data['bot']
+        with get_db_context() as db:
+            service = ChannelService(db)
+            is_sub, missing = await service.check_subscription(bot, event.from_user.id)
+            if not is_sub and missing:
+                await event.answer(
+                    f"⚠️ يجب الاشتراك في القناة التالية أولاً:\n{missing.channel_id}\n\n"
+                    "اشترك ثم أعد المحاولة."
+                )
+                return
+
+        return await handler(event, data)
+
+router.message.middleware(ForceJoinMiddleware())
+router.callback_query.middleware(ForceJoinMiddleware())
+
+# ---------- الأوامر الأساسية ----------
 @router.message(Command("profile"))
 async def cmd_profile(message: Message):
     await show_profile_logic(message)
@@ -121,14 +160,12 @@ async def cmd_featured(message: Message):
         else:
             await message.answer("لا توجد كتب مميزة حالياً.")
 
-# ---------- البحث (داخلي وخارجي) ----------
-
+# ---------- البحث ----------
 @router.message(Command("search"))
 async def cmd_search(message: Message, state: FSMContext):
     await message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
     await state.set_state(SearchStates.waiting_for_query)
 
-# زر "🔍 بحث" – سيُلغى المعالج القديم تلقائياً لأن هذا الراوتر يُضم أولاً
 @router.message(F.text == "🔍 بحث")
 async def search_button(message: Message, state: FSMContext):
     await message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
@@ -165,7 +202,7 @@ async def perform_search(callback: CallbackQuery, state: FSMContext):
         search_service = SearchService(db)
         if search_type == "search_text":
             books = await search_service.text_search(query, limit=5)
-        else:  # semantic
+        else:
             books = await search_service.semantic_search(query, limit=5)
 
     if books:
@@ -180,8 +217,7 @@ async def perform_search(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
 
-# ---------- تصفح الأقسام (تجاوز القديم) ----------
-
+# ---------- تصفح الأقسام ----------
 @router.message(F.text == "📚 تصفح الكتب")
 async def browse_books(message: Message):
     await message.answer("اختر القسم الذي تريد تصفحه:", reply_markup=get_category_keyboard())
@@ -233,7 +269,7 @@ async def handle_back(callback: CallbackQuery):
         logger.error(f"Error in handle_back: {str(e)}")
         await callback.answer("حدث خطأ")
 
-# ---------- الملف الشخصي و النقاط عبر الأزرار (نفس المنطق) ----------
+# ---------- أزرار الملف الشخصي والنقاط ----------
 @router.message(F.text == "👤 ملفي الشخصي")
 async def button_profile(message: Message):
     await show_profile_logic(message)
@@ -241,8 +277,8 @@ async def button_profile(message: Message):
 @router.message(F.text == "🎁 نقاطي")
 async def button_points(message: Message):
     await show_points_logic(message)
-# ---------- أزرار الأوامر التفاعلية (Inline) ----------
 
+# ---------- لوحة الأوامر التفاعلية ----------
 @router.callback_query(F.data == "cmd_profile")
 async def inline_profile(callback: CallbackQuery):
     await show_profile_logic(callback.message)
@@ -287,59 +323,6 @@ async def inline_search(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_query)
     await callback.answer()
 
-# ---------- أوامر الاشتراك الإجباري ----------
-@router.message(Command("addchannel"))
-async def cmd_add_channel(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return await message.answer("❌ غير مصرح")
-    await message.answer("📡 أرسل معرف القناة (مثال: @MyChannel) ليتم إضافتها للاشتراك الإجباري:")
-    await state.set_state("waiting_for_channel_id")
-
-@router.message(StateFilter("waiting_for_channel_id"))
-async def process_channel_id(message: Message, state: FSMContext):
-    channel_id = message.text.strip()
-    if not channel_id.startswith("@"):
-        return await message.answer("يجب أن يبدأ المعرف بـ @")
-    with get_db_context() as db:
-        service = ChannelService(db)
-        success = await service.add_channel(channel_id)
-        if success:
-            await message.answer(f"✅ تمت إضافة القناة {channel_id} بنجاح")
-        else:
-            await message.answer("❌ فشلت الإضافة، تأكد من عدم تكرار القناة")
-    await state.clear()
-
-@router.message(Command("removechannel"))
-async def cmd_remove_channel(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return await message.answer("❌ غير مصرح")
-    await message.answer("📡 أرسل معرف القناة التي تريد حذفها:")
-    await state.set_state("waiting_for_channel_remove")
-
-@router.message(StateFilter("waiting_for_channel_remove"))
-async def process_remove_channel(message: Message, state: FSMContext):
-    channel_id = message.text.strip()
-    with get_db_context() as db:
-        service = ChannelService(db)
-        if await service.remove_channel(channel_id):
-            await message.answer(f"✅ تم حذف القناة {channel_id}")
-        else:
-            await message.answer("❌ القناة غير موجودة")
-    await state.clear()
-
-@router.message(Command("listchannels"))
-async def cmd_list_channels(message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.answer("❌ غير مصرح")
-    with get_db_context() as db:
-        service = ChannelService(db)
-        channels = await service.get_all_channels()
-        if not channels:
-            return await message.answer("لا توجد قنوات اشتراك إجباري حالياً")
-        text = "📋 **قنوات الاشتراك الإجباري**\n\n"
-        for ch in channels:
-            text += f"• {ch.channel_id} {'✅' if ch.is_required else '🟡'}\n"
-        await message.answer(text)
 @router.callback_query(F.data == "cmd_help")
 async def inline_help(callback: CallbackQuery):
     help_text = (
@@ -357,9 +340,120 @@ async def inline_help(callback: CallbackQuery):
     await callback.message.answer(help_text)
     await callback.answer()
 
-# ---------- زر لعرض لوحة الأوامر التفاعلية (اختياري) ----------
-# يمكنك إضافة زر "📋 الأوامر" في لوحة المفاتيح الرئيسية، أو إرسال أمر /commands
 @router.message(Command("commands"))
 @router.message(F.text == "📋 الأوامر")
 async def show_commands(message: Message):
     await message.answer("اختر الأمر الذي تريد:", reply_markup=get_commands_inline_keyboard())
+
+# ---------- أوامر الاشتراك الإجباري (للمالك فقط) ----------
+@router.message(Command("addchannel"))
+async def cmd_add_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📡 أرسل معرف القناة (مثال: @MyChannel):")
+    await state.set_state(ChannelStates.waiting_for_channel_id)
+
+@router.message(ChannelStates.waiting_for_channel_id)
+async def process_channel_id(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    if not channel_id.startswith("@"):
+        return await message.answer("يجب أن يبدأ المعرف بـ @")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        success = await service.add_channel(channel_id)
+        if success:
+            await message.answer(f"✅ تمت إضافة القناة {channel_id} للاشتراك الإجباري")
+        else:
+            await message.answer("❌ فشلت الإضافة، قد تكون القناة مكررة")
+    await state.clear()
+
+@router.message(Command("removechannel"))
+async def cmd_remove_channel(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("📡 أرسل معرف القناة التي تريد حذفها:")
+    await state.set_state(ChannelStates.waiting_for_channel_remove)
+
+@router.message(ChannelStates.waiting_for_channel_remove)
+async def process_remove_channel(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    with get_db_context() as db:
+        service = ChannelService(db)
+        if await service.remove_channel(channel_id):
+            await message.answer(f"✅ تم حذف القناة {channel_id}")
+        else:
+            await message.answer("❌ القناة غير موجودة في القائمة")
+    await state.clear()
+
+@router.message(Command("listchannels"))
+async def cmd_list_channels(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        channels = await service.get_all_channels()
+        if not channels:
+            return await message.answer("لا توجد قنوات اشتراك إجباري حالياً")
+        text = "📋 **قنوات الاشتراك الإجباري**\n\n"
+        for ch in channels:
+            text += f"• {ch.channel_id} {'✅ إجباري' if ch.is_required else '🟡 اختياري'}\n"
+        await message.answer(text)
+
+# ---------- لوحة تحكم المالك التفاعلية ----------
+@router.message(Command("admin"))
+async def cmd_admin_panel(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ هذا الأمر مخصص للمالك فقط.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 إحصائيات", callback_data="owner_stats")],
+        [InlineKeyboardButton(text="📚 كتب قيد المراجعة", callback_data="owner_pending")],
+        [InlineKeyboardButton(text="📡 قنوات الإجبار", callback_data="owner_channels")],
+        [InlineKeyboardButton(text="🔙 إغلاق", callback_data="owner_close")]
+    ])
+    await message.answer("👑 **لوحة تحكم المالك**", reply_markup=keyboard)
+
+@router.callback_query(F.data == "owner_stats")
+async def owner_stats(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    with get_db_context() as db:
+        service = AdminService(db)
+        stats = await service.get_statistics()
+        text = (
+            "📊 **إحصائيات النظام**\n\n"
+            f"👥 المستخدمين: {stats.get('total_users', 0)}\n"
+            f"🟢 نشط: {stats.get('active_users', 0)}\n"
+            f"📚 الكتب: {stats.get('total_books', 0)}\n"
+            f"📗 نشطة: {stats.get('active_books', 0)}\n"
+            f"⏳ قيد المراجعة: {stats.get('pending_books', 0)}"
+        )
+    await callback.message.answer(text)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_pending")
+async def owner_pending(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    with get_db_context() as db:
+        service = AdminService(db)
+        books = await service.get_pending_books(10)
+        if books:
+            text = "📚 **كتب قيد المراجعة**\n\n"
+            for b in books:
+                text += f"• {b.title} (ID: {b.id})\n"
+        else:
+            text = "لا توجد كتب قيد المراجعة."
+    await callback.message.answer(text)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_channels")
+async def owner_channels(callback: CallbackQuery):
+    await cmd_list_channels(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_close")
+async def owner_close(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
