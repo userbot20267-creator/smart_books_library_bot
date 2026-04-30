@@ -6,6 +6,8 @@ from .review import Review, Rating
 from .points import UserPoints, PointsTransaction
 from .coupon import Coupon, UserCoupon
 from .referral import Referral
+from .author import Author
+# وفي __all__ أضف "Author"
 from .pack import Pack, PackBook
 from .admin import AdminUser, AdminLog
 from .force_join import ForceJoinChannel
