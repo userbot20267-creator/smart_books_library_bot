@@ -1,7 +1,7 @@
 """
 New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix,
 Force Join Channels, Owner Interactive Panel, Categories & Authors Management,
-AI-Powered Book Finder & Adder
+AI-Powered Book Finder & Adder (Fully Fixed)
 """
 
 import logging
@@ -119,6 +119,27 @@ class ForceJoinMiddleware(BaseMiddleware):
         event: Message,
         data: Dict[str, Any]
     ) -> Any:
+        # التعامل مع CallbackQuery (أزرار)
+        if isinstance(event, CallbackQuery):
+            if not event.from_user:
+                return await handler(event, data)
+            if is_owner(event.from_user.id):
+                return await handler(event, data)
+            # فحص الاشتراك للأزرار
+            bot = data['bot']
+            with get_db_context() as db:
+                service = ChannelService(db)
+                is_sub, missing = await service.check_subscription(bot, event.from_user.id)
+                if not is_sub and missing:
+                    await event.answer(
+                        f"⚠️ يجب الاشتراك في القناة التالية أولاً:\n{missing.channel_id}\n\n"
+                        "اشترك ثم أعد المحاولة.",
+                        show_alert=True
+                    )
+                    return
+            return await handler(event, data)
+
+        # التعامل مع Message
         if not event.from_user:
             return await handler(event, data)
 
@@ -144,7 +165,7 @@ class ForceJoinMiddleware(BaseMiddleware):
 router.message.middleware(ForceJoinMiddleware())
 router.callback_query.middleware(ForceJoinMiddleware())
 
-# ---------- الأوامر الأساسية ----------
+# ---------- الأوامر الأساسية (نفسها) ----------
 @router.message(Command("profile"))
 async def cmd_profile(message: Message):
     await show_profile_logic(message)
@@ -179,7 +200,7 @@ async def cmd_featured(message: Message):
         else:
             await message.answer("لا توجد كتب مميزة حالياً.")
 
-# ---------- البحث ----------
+# ---------- البحث (نفسه) ----------
 @router.message(Command("search"))
 async def cmd_search(message: Message, state: FSMContext):
     await message.answer("اكتب كلمة البحث (عنوان أو مؤلف):")
@@ -236,7 +257,7 @@ async def perform_search(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
 
-# ---------- تصفح الأقسام ----------
+# ---------- تصفح الأقسام (نفسه) ----------
 @router.message(F.text == "📚 تصفح الكتب")
 async def browse_books(message: Message):
     await message.answer("اختر القسم الذي تريد تصفحه:", reply_markup=get_category_keyboard())
@@ -297,7 +318,7 @@ async def button_profile(message: Message):
 async def button_points(message: Message):
     await show_points_logic(message)
 
-# ---------- لوحة الأوامر التفاعلية ----------
+# ---------- لوحة الأوامر التفاعلية (نفسها) ----------
 @router.callback_query(F.data == "cmd_profile")
 async def inline_profile(callback: CallbackQuery):
     await show_profile_logic(callback.message)
@@ -364,7 +385,46 @@ async def inline_help(callback: CallbackQuery):
 async def show_commands(message: Message):
     await message.answer("اختر الأمر الذي تريد:", reply_markup=get_commands_inline_keyboard())
 
-# ---------- أوامر الاشتراك الإجباري ----------
+# ---------- أوامر الاشتراك الإجباري (تستخدم user_id) ----------
+async def list_channels_logic(message: Message, user_id: int):
+    """منطق عرض القنوات مع فحص user_id"""
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        service = ChannelService(db)
+        channels = await service.get_all_channels()
+        if not channels:
+            return await message.answer("لا توجد قنوات اشتراك إجباري حالياً")
+        text = "📋 **قنوات الاشتراك الإجباري**\n\n"
+        for ch in channels:
+            text += f"• {ch.channel_id} {'✅ إجباري' if ch.is_required else '🟡 اختياري'}\n"
+        await message.answer(text)
+
+async def list_categories_logic(message: Message, user_id: int):
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            return await message.answer("لا توجد أقسام")
+        text = "📁 **الأقسام**\n\n"
+        for c in cats:
+            text += f"• {c.name} (ID: {c.id})\n"
+        await message.answer(text)
+
+async def list_authors_logic(message: Message, user_id: int):
+    if not is_owner(user_id):
+        return await message.answer("❌ غير مصرح")
+    with get_db_context() as db:
+        authors = await AuthorService(db).list_all()
+        if not authors:
+            return await message.answer("لا يوجد مؤلفون")
+        text = "✍️ **المؤلفون**\n\n"
+        for a in authors:
+            text += f"• {a.name} (ID: {a.id})\n"
+        await message.answer(text)
+
+# ---------- أوامر الاشتراك الإجباري (للمالك فقط) ----------
 @router.message(Command("addchannel"))
 async def cmd_add_channel(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
@@ -406,19 +466,9 @@ async def process_remove_channel(message: Message, state: FSMContext):
 
 @router.message(Command("listchannels"))
 async def cmd_list_channels(message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.answer("❌ غير مصرح")
-    with get_db_context() as db:
-        service = ChannelService(db)
-        channels = await service.get_all_channels()
-        if not channels:
-            return await message.answer("لا توجد قنوات اشتراك إجباري حالياً")
-        text = "📋 **قنوات الاشتراك الإجباري**\n\n"
-        for ch in channels:
-            text += f"• {ch.channel_id} {'✅ إجباري' if ch.is_required else '🟡 اختياري'}\n"
-        await message.answer(text)
+    await list_channels_logic(message, message.from_user.id)
 
-# ---------- إدارة الأقسام ----------
+# ---------- إدارة الأقسام (تستخدم user_id) ----------
 @router.message(Command("addcategory"))
 async def cmd_addcategory(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
@@ -469,18 +519,9 @@ async def process_delete_category(message: Message, state: FSMContext):
 
 @router.message(Command("listcategories"))
 async def cmd_listcategories(message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.answer("❌ غير مصرح")
-    with get_db_context() as db:
-        cats = await CategoryService(db).list_all()
-        if not cats:
-            return await message.answer("لا توجد أقسام")
-        text = "📁 **الأقسام**\n\n"
-        for c in cats:
-            text += f"• {c.name} (ID: {c.id})\n"
-        await message.answer(text)
+    await list_categories_logic(message, message.from_user.id)
 
-# ---------- إدارة المؤلفين ----------
+# ---------- إدارة المؤلفين (تستخدم user_id) ----------
 @router.message(Command("addauthor"))
 async def cmd_addauthor(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
@@ -527,31 +568,37 @@ async def process_delete_author(message: Message, state: FSMContext):
 
 @router.message(Command("listauthors"))
 async def cmd_listauthors(message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.answer("❌ غير مصرح")
-    with get_db_context() as db:
-        authors = await AuthorService(db).list_all()
-        if not authors:
-            return await message.answer("لا يوجد مؤلفون")
-        text = "✍️ **المؤلفون**\n\n"
-        for a in authors:
-            text += f"• {a.name} (ID: {a.id})\n"
-        await message.answer(text)
+    await list_authors_logic(message, message.from_user.id)
 
-# ---------- أمر الذكاء الاصطناعي: /aifind ----------
+# ---------- أمر الذكاء الاصطناعي: /aifind (يستخدم callback.from_user) ----------
 @router.message(Command("aifind"))
-async def cmd_aifind(message: Message, state: FSMContext):
+async def cmd_aifind_message(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return await message.answer("❌ غير مصرح")
     await message.answer("اكتب وصفًا للكتاب الذي تريد البحث عنه (مثلاً: 'كتاب عن تعلم الآلة بالعربية'):")
     await state.set_state(AIFindStates.waiting_for_description)
 
+# هذا المعالج يستخدم للزر المالك
+@router.callback_query(F.data == "owner_aifind")
+async def owner_aifind_callback(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح", show_alert=True)
+        return
+    await callback.message.answer("اكتب وصفًا للكتاب الذي تريد البحث عنه:")
+    await state.set_state(AIFindStates.waiting_for_description)
+    await callback.answer()
+
 @router.message(AIFindStates.waiting_for_description)
 async def process_ai_description(message: Message, state: FSMContext):
+    # التحقق من المالك
+    if not is_owner(message.from_user.id):
+        await message.answer("❌ غير مصرح")
+        await state.clear()
+        return
+
     await state.update_data(desc=message.text.strip())
     await message.answer("جاري البحث بواسطة الذكاء الاصطناعي...")
     ai_service = AIService()
-    # محاكاة رد من AI (يمكنك استبدالها بدالة حقيقية مثل generate_summary أو API call)
     suggested = await ai_service.classify_book(
         title="عنوان مقترح",
         description=message.text.strip(),
@@ -561,14 +608,12 @@ async def process_ai_description(message: Message, state: FSMContext):
         await message.answer("فشل الاتصال بالذكاء الاصطناعي. تأكد من المفاتيح أو حاول لاحقًا.")
         await state.clear()
         return
-    
-    # تخزين بيانات الكتاب المقترحة
+
     await state.update_data(
         book_title="عنوان مقترح من AI",
         book_author="مؤلف مقترح من AI",
         book_desc=message.text.strip()
     )
-    
     text = (
         f"🤖 **اقتراح الكتاب**\n\n"
         f"📖 العنوان: {suggested.get('title', 'غير معروف')}\n"
@@ -585,7 +630,6 @@ async def process_ai_description(message: Message, state: FSMContext):
 @router.callback_query(AIFindStates.choosing_category, F.data == "aifind_confirm")
 async def aifind_choose_category(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    # عرض الأقسام المتاحة
     with get_db_context() as db:
         cats = await CategoryService(db).list_all()
         if not cats:
@@ -600,12 +644,10 @@ async def aifind_choose_category(callback: CallbackQuery, state: FSMContext):
 async def aifind_set_category(callback: CallbackQuery, state: FSMContext):
     cat_id = int(callback.data.replace("aicat_", ""))
     await state.update_data(cat_id=cat_id)
-    # عرض المؤلفين
     with get_db_context() as db:
         authors = await AuthorService(db).list_all()
         if not authors:
-            # عدم وجود مؤلفين، يمكن اختيار إضافة جديد
-            await callback.message.answer("لا يوجد مؤلفون في القاعدة. أرسل اسم المؤلف الجديد:")
+            await callback.message.answer("لا يوجد مؤلفون. أرسل اسم المؤلف الجديد:")
             await state.set_state(AIFindStates.waiting_for_new_author)
             await callback.answer()
             return
@@ -629,7 +671,6 @@ async def process_new_author(message: Message, state: FSMContext):
     with get_db_context() as db:
         author = await AuthorService(db).create(name=name)
         await state.update_data(author_id=author.id)
-    # الموافقة على إضافة الكتاب
     data = await state.get_data()
     with get_db_context() as db:
         book = Book(
@@ -675,7 +716,7 @@ async def aifind_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-# ---------- لوحة تحكم المالك التفاعلية ----------
+# ---------- لوحة تحكم المالك التفاعلية (مُصلحة بالكامل) ----------
 @router.message(Command("admin"))
 async def cmd_admin_panel(message: Message):
     if not is_owner(message.from_user.id):
@@ -729,22 +770,17 @@ async def owner_pending(callback: CallbackQuery):
 
 @router.callback_query(F.data == "owner_channels")
 async def owner_channels(callback: CallbackQuery):
-    await cmd_list_channels(callback.message)
+    await list_channels_logic(callback.message, callback.from_user.id)
     await callback.answer()
 
 @router.callback_query(F.data == "owner_categories")
 async def owner_categories(callback: CallbackQuery):
-    await cmd_listcategories(callback.message)
+    await list_categories_logic(callback.message, callback.from_user.id)
     await callback.answer()
 
 @router.callback_query(F.data == "owner_authors")
 async def owner_authors(callback: CallbackQuery):
-    await cmd_listauthors(callback.message)
-    await callback.answer()
-
-@router.callback_query(F.data == "owner_aifind")
-async def owner_aifind(callback: CallbackQuery):
-    await cmd_aifind(callback.message, AIFindStates.waiting_for_description)
+    await list_authors_logic(callback.message, callback.from_user.id)
     await callback.answer()
 
 @router.callback_query(F.data == "owner_close")
