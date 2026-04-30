@@ -7,10 +7,10 @@ from .points import UserPoints, PointsTransaction
 from .coupon import Coupon, UserCoupon
 from .referral import Referral
 from .author import Author
-# وفي __all__ أضف "Author"
 from .pack import Pack, PackBook
 from .admin import AdminUser, AdminLog
 from .force_join import ForceJoinChannel
+
 __all__ = [
     "User",
     "Book",
@@ -22,14 +22,10 @@ __all__ = [
     "Coupon",
     "UserCoupon",
     "Referral",
+    "Author",
     "Pack",
     "PackBook",
     "AdminUser",
     "AdminLog",
-
-
-# أضفها إلى قائمة __all__
-__all__ = [
-    # ... الموجودين
     "ForceJoinChannel",
 ]
