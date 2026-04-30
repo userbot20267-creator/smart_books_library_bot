@@ -16,6 +16,7 @@ from app.database import get_db_context
 from app.services.user_service import UserService
 from app.services.points_service import PointsService
 from app.admin.admin_service import AdminService
+from app.models.book import Book, BookCategory, BookStatus  # ← أضيف
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -320,13 +321,47 @@ async def process_reject(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cat_"))
 async def handle_category(callback: CallbackQuery):
+    """معالجة اختيار القسم وعرض الكتب الموجودة فيه"""
     try:
-        category = callback.data.replace("cat_", "")
-        await callback.message.answer(f"جاري تحميل كتب قسم {category}...")
+        # اسم القسم بالعربية كما هو في قاعدة البيانات
+        category_data = {
+            "programming": "البرمجة",
+            "self_dev": "التنمية الذاتية",
+            "romance": "الرومانسية",
+            "scifi": "الخيال العلمي",
+            "history": "التاريخ"
+        }
+        cat_key = callback.data.replace("cat_", "")
+        cat_name_ar = category_data.get(cat_key, cat_key)
+
+        with get_db_context() as db:
+            # البحث عن القسم باستخدام الاسم العربي
+            category = db.query(BookCategory).filter(BookCategory.name_ar == cat_name_ar).first()
+            
+            if not category:
+                await callback.message.answer("القسم غير موجود حالياً.")
+                await callback.answer()
+                return
+
+            # جلب آخر 10 كتب نشطة في هذا القسم
+            books = db.query(Book).filter(
+                Book.category_id == category.id,
+                Book.status == BookStatus.ACTIVE
+            ).order_by(Book.created_at.desc()).limit(10).all()
+
+            if books:
+                text = f"📚 **كتب قسم {cat_name_ar}**\n\n"
+                for i, book in enumerate(books, 1):
+                    text += f"{i}. {book.title} - {book.author}\n"
+                text += "\nلتحميل كتاب، أرسل /get متبوعاً برقم الكتاب"
+                await callback.message.answer(text)
+            else:
+                await callback.message.answer(f"لا توجد كتب في قسم {cat_name_ar} حالياً.")
+
         await callback.answer()
     except Exception as e:
         logger.error(f"Error in handle_category: {str(e)}")
-        await callback.answer("حدث خطأ")
+        await callback.answer("حدث خطأ، حاول لاحقاً.")
 
 @router.callback_query(F.data == "back")
 async def handle_back(callback: CallbackQuery):
