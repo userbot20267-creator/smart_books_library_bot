@@ -89,3 +89,16 @@ def get_language_keyboard():
         ]
     )
     return keyboard
+def get_commands_inline_keyboard():
+    """لوحة الأوامر الرئيسية كأزرار Inline"""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 ملفي الشخصي", callback_data="cmd_profile")],
+            [InlineKeyboardButton(text="🎁 نقاطي", callback_data="cmd_points")],
+            [InlineKeyboardButton(text="🔥 الكتب الرائجة", callback_data="cmd_trending")],
+            [InlineKeyboardButton(text="⭐ الكتب المميزة", callback_data="cmd_featured")],
+            [InlineKeyboardButton(text="🔍 بحث", callback_data="cmd_search")],
+            [InlineKeyboardButton(text="📋 المساعدة", callback_data="cmd_help")],
+        ]
+    )
+    return keyboard
