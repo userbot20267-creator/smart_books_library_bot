@@ -51,7 +51,7 @@ class User(Base):
     ratings = relationship("Rating", back_populates="user", cascade="all, delete-orphan")
     coupons = relationship("UserCoupon", back_populates="user", cascade="all, delete-orphan")
     referrals_given = relationship("Referral", foreign_keys="Referral.referrer_id", back_populates="referrer")
-    referrals_received = relationship("Referral", foreign_keys="Referral.referred_id", back_populates="referred)
+    referrals_received = relationship("Referral", foreign_keys="Referral.referred_id", back_populates="referred")
     admin_logs = relationship("AdminLog", back_populates="user")
 
     def __repr__(self):
