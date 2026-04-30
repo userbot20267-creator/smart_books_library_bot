@@ -1,6 +1,7 @@
 """
 New Features Handlers – Search, Profile, Points, Trending, Featured, Categories fix,
-Force Join Channels, Owner Interactive Panel, Categories & Authors Management
+Force Join Channels, Owner Interactive Panel, Categories & Authors Management,
+AI-Powered Book Finder & Adder
 """
 
 import logging
@@ -26,6 +27,7 @@ from app.services.search_service import SearchService
 from app.services.channel_service import ChannelService
 from app.services.category_service import CategoryService
 from app.services.author_service import AuthorService
+from app.services.ai_service import AIService
 from app.models.book import Book, BookCategory, BookStatus
 from app.models.author import Author
 from app.admin.admin_service import AdminService
@@ -51,6 +53,12 @@ class AuthorStates(StatesGroup):
     waiting_for_author_name = State()
     waiting_for_author_bio = State()
     waiting_for_author_id = State()
+
+class AIFindStates(StatesGroup):
+    waiting_for_description = State()
+    choosing_category = State()
+    choosing_author = State()
+    waiting_for_new_author = State()
 
 # ---------- دوال مساعدة ----------
 def is_owner(telegram_id: int) -> bool:
@@ -530,6 +538,143 @@ async def cmd_listauthors(message: Message):
             text += f"• {a.name} (ID: {a.id})\n"
         await message.answer(text)
 
+# ---------- أمر الذكاء الاصطناعي: /aifind ----------
+@router.message(Command("aifind"))
+async def cmd_aifind(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer("❌ غير مصرح")
+    await message.answer("اكتب وصفًا للكتاب الذي تريد البحث عنه (مثلاً: 'كتاب عن تعلم الآلة بالعربية'):")
+    await state.set_state(AIFindStates.waiting_for_description)
+
+@router.message(AIFindStates.waiting_for_description)
+async def process_ai_description(message: Message, state: FSMContext):
+    await state.update_data(desc=message.text.strip())
+    await message.answer("جاري البحث بواسطة الذكاء الاصطناعي...")
+    ai_service = AIService()
+    # محاكاة رد من AI (يمكنك استبدالها بدالة حقيقية مثل generate_summary أو API call)
+    suggested = await ai_service.classify_book(
+        title="عنوان مقترح",
+        description=message.text.strip(),
+        author="مؤلف مقترح"
+    )
+    if not suggested:
+        await message.answer("فشل الاتصال بالذكاء الاصطناعي. تأكد من المفاتيح أو حاول لاحقًا.")
+        await state.clear()
+        return
+    
+    # تخزين بيانات الكتاب المقترحة
+    await state.update_data(
+        book_title="عنوان مقترح من AI",
+        book_author="مؤلف مقترح من AI",
+        book_desc=message.text.strip()
+    )
+    
+    text = (
+        f"🤖 **اقتراح الكتاب**\n\n"
+        f"📖 العنوان: {suggested.get('title', 'غير معروف')}\n"
+        f"✍️ المؤلف: {suggested.get('author', 'غير معروف')}\n"
+        f"📝 التصنيف: {suggested.get('category', 'غير معروف')}\n"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ إضافة فعليًا", callback_data="aifind_confirm")],
+        [InlineKeyboardButton(text="❌ تجاهل", callback_data="aifind_cancel")]
+    ])
+    await message.answer(text, reply_markup=keyboard)
+    await state.set_state(AIFindStates.choosing_category)
+
+@router.callback_query(AIFindStates.choosing_category, F.data == "aifind_confirm")
+async def aifind_choose_category(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    # عرض الأقسام المتاحة
+    with get_db_context() as db:
+        cats = await CategoryService(db).list_all()
+        if not cats:
+            await callback.message.answer("لا توجد أقسام. قم بإنشاء قسم أولاً.")
+            return
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=c.name, callback_data=f"aicat_{c.id}")] for c in cats
+        ])
+    await callback.message.answer("اختر قسمًا للكتاب:", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("aicat_"))
+async def aifind_set_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.replace("aicat_", ""))
+    await state.update_data(cat_id=cat_id)
+    # عرض المؤلفين
+    with get_db_context() as db:
+        authors = await AuthorService(db).list_all()
+        if not authors:
+            # عدم وجود مؤلفين، يمكن اختيار إضافة جديد
+            await callback.message.answer("لا يوجد مؤلفون في القاعدة. أرسل اسم المؤلف الجديد:")
+            await state.set_state(AIFindStates.waiting_for_new_author)
+            await callback.answer()
+            return
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=a.name, callback_data=f"aiauth_{a.id}")] for a in authors
+        ])
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="إنشاء مؤلف جديد", callback_data="aiauth_new")])
+    await callback.message.answer("اختر المؤلف:", reply_markup=keyboard)
+    await state.set_state(AIFindStates.choosing_author)
+    await callback.answer()
+
+@router.callback_query(AIFindStates.choosing_author, F.data == "aiauth_new")
+async def aifind_new_author(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("أرسل اسم المؤلف الجديد:")
+    await state.set_state(AIFindStates.waiting_for_new_author)
+    await callback.answer()
+
+@router.message(AIFindStates.waiting_for_new_author)
+async def process_new_author(message: Message, state: FSMContext):
+    name = message.text.strip()
+    with get_db_context() as db:
+        author = await AuthorService(db).create(name=name)
+        await state.update_data(author_id=author.id)
+    # الموافقة على إضافة الكتاب
+    data = await state.get_data()
+    with get_db_context() as db:
+        book = Book(
+            title=data.get('book_title', 'عنوان AI'),
+            author=author.name,
+            description=data.get('book_desc', ''),
+            category_id=data.get('cat_id'),
+            file_path=None,
+            status=BookStatus.PENDING
+        )
+        db.add(book)
+        db.commit()
+        await message.answer(f"✅ تمت إضافة الكتاب '{book.title}' تحت القسم المختار والمؤلف '{author.name}'.")
+    await state.clear()
+
+@router.callback_query(AIFindStates.choosing_author, F.data.startswith("aiauth_"))
+async def aifind_existing_author(callback: CallbackQuery, state: FSMContext):
+    author_id = int(callback.data.replace("aiauth_", ""))
+    await state.update_data(author_id=author_id)
+    with get_db_context() as db:
+        author = db.query(Author).get(author_id)
+        if not author:
+            await callback.message.answer("المؤلف غير موجود.")
+            await state.clear()
+            return
+        data = await state.get_data()
+        book = Book(
+            title=data.get('book_title', 'عنوان AI'),
+            author=author.name,
+            description=data.get('book_desc', ''),
+            category_id=data.get('cat_id'),
+            file_path=None,
+            status=BookStatus.PENDING
+        )
+        db.add(book)
+        db.commit()
+        await callback.message.answer(f"✅ تمت إضافة الكتاب '{book.title}' تحت القسم المختار والمؤلف '{author.name}'.")
+    await state.clear()
+
+@router.callback_query(F.data == "aifind_cancel")
+async def aifind_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("تم إلغاء العملية.")
+    await state.clear()
+    await callback.answer()
+
 # ---------- لوحة تحكم المالك التفاعلية ----------
 @router.message(Command("admin"))
 async def cmd_admin_panel(message: Message):
@@ -541,6 +686,7 @@ async def cmd_admin_panel(message: Message):
         [InlineKeyboardButton(text="📡 قنوات الإجبار", callback_data="owner_channels")],
         [InlineKeyboardButton(text="📁 إدارة الأقسام", callback_data="owner_categories")],
         [InlineKeyboardButton(text="✍️ إدارة المؤلفين", callback_data="owner_authors")],
+        [InlineKeyboardButton(text="🤖 بحث ذكي / AI", callback_data="owner_aifind")],
         [InlineKeyboardButton(text="🔙 إغلاق", callback_data="owner_close")]
     ])
     await message.answer("👑 **لوحة تحكم المالك**", reply_markup=keyboard)
@@ -594,6 +740,11 @@ async def owner_categories(callback: CallbackQuery):
 @router.callback_query(F.data == "owner_authors")
 async def owner_authors(callback: CallbackQuery):
     await cmd_listauthors(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "owner_aifind")
+async def owner_aifind(callback: CallbackQuery):
+    await cmd_aifind(callback.message, AIFindStates.waiting_for_description)
     await callback.answer()
 
 @router.callback_query(F.data == "owner_close")
